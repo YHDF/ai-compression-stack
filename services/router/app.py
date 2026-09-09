@@ -16,6 +16,14 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip()
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
+
+MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
+IGNORED_EXTENSIONS = {
+    ".log", ".lock", ".tmp", ".bin", ".tar", ".gz", ".zip", ".7z",
+    ".pyc", ".pyo", ".pyd", ".db", ".sqlite", ".sqlite3", ".parquet",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot"
+}
 
 # Initialize Gemini client only if a non-empty key is provided
 gemini_client = None
@@ -142,9 +150,75 @@ def healthz():
                 "headroom": "reachable" if headroom_ok else "unreachable"
             },
             "ollama_url": OLLAMA_URL,
-            "headroom_proxy": HEADROOM_PROXY
+            "headroom_proxy": HEADROOM_PROXY,
+            "workspace_dir": WORKSPACE_DIR
         }
     )
+
+def read_target_files(target_files: List[str]) -> str:
+    """Router Pre-Reader: Ingests matching target files from /workspace, filtering >50KB and non-code/logs."""
+    if not target_files or not os.path.exists(WORKSPACE_DIR):
+        return ""
+
+    context_blocks = []
+    workspace_root = os.path.abspath(WORKSPACE_DIR)
+
+    for raw_path in target_files:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        clean_path = raw_path.strip()
+
+        # Resolve path within workspace
+        if os.path.isabs(clean_path):
+            abs_path = os.path.abspath(clean_path)
+        else:
+            abs_path = os.path.abspath(os.path.join(workspace_root, clean_path))
+
+        # Security check: avoid directory traversal outside workspace
+        if not abs_path.startswith(workspace_root):
+            print(f"Notice: Path outside workspace rejected: {clean_path}")
+            continue
+
+        if not os.path.isfile(abs_path):
+            continue
+
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext in IGNORED_EXTENSIONS or "log" in os.path.basename(abs_path).lower():
+            print(f"Notice: Non-code/log file skipped: {clean_path}")
+            continue
+
+        try:
+            file_size = os.path.getsize(abs_path)
+            if file_size > MAX_PRE_READ_SIZE:
+                print(f"Notice: Oversized file skipped ({file_size} > 50KB): {clean_path}")
+                continue
+
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            rel_path = os.path.relpath(abs_path, workspace_root)
+            lang = ext.lstrip(".") if ext else "text"
+            context_blocks.append(f"### File: {rel_path}\n```{lang}\n{content}\n```")
+        except Exception as e:
+            print(f"Notice: Error reading file {abs_path}: {e}")
+
+    if context_blocks:
+        return "## Workspace Pre-Read Context:\n" + "\n\n".join(context_blocks)
+    return ""
+
+def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
+    """Enforce operational boundaries on agy to prevent multi-turn search loops and quota exhaustion."""
+    guardrails = (
+        "## Operational Boundaries & Guardrails:\n"
+        "- Scope: Modify strictly the specified target files in the workspace.\n"
+        "- Safeguards: DO NOT trigger unbounded recursive directory scans, multi-turn web search loops, or unrelated edits.\n"
+        "- Output: Maintain concise diffs and clear summaries.\n\n"
+    )
+    parts = [guardrails]
+    if context_str:
+        parts.append(context_str + "\n\n")
+    parts.append(f"## Architectural Task Specification:\n{beautified_prompt}")
+    return "".join(parts)
 
 def compress_prompt(prompt: str) -> str:
     """Strip AST/JSON bloat via Headroom proxy before execution."""
@@ -165,15 +239,22 @@ def compress_prompt(prompt: str) -> str:
     return prompt
 
 def execute_agy(prepared_prompt: str) -> Optional[str]:
-    """Execute agy CLI non-interactively using Python subprocess with 180s timeout."""
+    """Execute agy CLI non-interactively with --add-dir /workspace and a 180s timeout."""
     agy_path = shutil.which("agy") or "/usr/local/bin/agy"
     if not os.path.exists(agy_path) and not shutil.which("agy"):
         print(f"agy executable not found at {agy_path}")
         return None
 
-    cmd = [agy_path, "--dangerously-skip-permissions", "-p", prepared_prompt]
+    # Enforce workspace access and skip interactive prompts
+    cmd = [
+        agy_path,
+        "--add-dir", WORKSPACE_DIR,
+        "--dangerously-skip-permissions",
+        "-p", prepared_prompt
+    ]
     env = os.environ.copy()
     env["HOME"] = "/root"
+    cwd = WORKSPACE_DIR if os.path.exists(WORKSPACE_DIR) else None
 
     try:
         proc = subprocess.run(
@@ -181,7 +262,8 @@ def execute_agy(prepared_prompt: str) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=180,
-            env=env
+            env=env,
+            cwd=cwd
         )
         output = proc.stdout.strip()
         stderr_lower = proc.stderr.lower() if proc.stderr else ""
@@ -224,34 +306,38 @@ def completions(req: ChatCompletionRequest):
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + gen_out)
 
-    # 2. Local Distillation (Ollama)
+    # 2. Local Prompt Beautification & Target Extraction (Ollama)
     structured_schema = {
         "type": "object",
         "properties": {
             "is_complex_agent": {
                 "type": "boolean",
-                "description": "True if prompt involves multi-file refactoring, broad codebase edits, or agent-level actions. False for standard questions, single snippets, or algorithms."
+                "description": "True if prompt involves multi-file refactoring, broad codebase edits, or agent-level actions. False for standard single functions, questions, or algorithms."
             },
-            "distilled_prompt": {
+            "beautified_prompt": {
                 "type": "string",
-                "description": "The distilled and focused instruction."
+                "description": "Clean, concise, and structured architectural engineering specification converted from informal or messy user prompt."
             },
-            "file_dependencies": {
+            "target_files": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "List of affected or referenced files."
+                "description": "Specific file paths in the workspace to inspect or modify."
             }
         },
-        "required": ["is_complex_agent", "distilled_prompt"]
+        "required": ["is_complex_agent", "beautified_prompt"]
     }
 
-    meta = {"is_complex_agent": False, "distilled_prompt": prompt_text, "file_dependencies": []}
+    meta = {"is_complex_agent": False, "beautified_prompt": prompt_text, "target_files": []}
     try:
         ollama_res = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
-                "prompt": f"Analyze this user coding request. Classify whether it requires an interactive complex agent or is a simple task. Distill the prompt and isolate file dependencies:\n\n{prompt_text}",
+                "prompt": (
+                    "Convert this user coding request into a clean, concise, and structured architectural engineering specification. "
+                    "Eliminate informal chatter, slang, or noise. Classify whether it requires an interactive complex agent, "
+                    f"and isolate exact target file paths:\n\n{prompt_text}"
+                ),
                 "format": structured_schema,
                 "stream": False
             },
@@ -263,21 +349,28 @@ def completions(req: ChatCompletionRequest):
             if isinstance(raw_meta, dict):
                 meta.update(raw_meta)
     except Exception as e:
-        print(f"Ollama distillation fallback: {e}")
+        print(f"Ollama beautification fallback: {e}")
 
     is_complex = meta.get("is_complex_agent", False)
-    distilled_prompt = meta.get("distilled_prompt") or prompt_text
+    beautified = meta.get("beautified_prompt") or prompt_text
+    target_files = meta.get("target_files", [])
 
-    # 3 & 4. Complex Agent Task -> Headroom Compression -> agy Execution
+    # 3 & 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
     if is_complex:
-        compressed_prompt = compress_prompt(distilled_prompt)
+        # Pre-read matching files from workspace
+        context_str = read_target_files(target_files)
+        # Apply anti-hallucination & quota safeguards
+        guarded_prompt = apply_guardrails(beautified, context_str)
+        # Strip AST / boilerplate bloat via Headroom
+        compressed_prompt = compress_prompt(guarded_prompt)
+
         agy_output = execute_agy(compressed_prompt)
         if agy_output is not None:
             out = "*[Agent Task: Headroom + Antigravity]*\n\n" + agy_output
             return package_response(req.model, out)
 
         # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama
-        fallback_out = call_ollama_generation(distilled_prompt)
+        fallback_out = call_ollama_generation(beautified)
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
 
     # Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
@@ -285,7 +378,7 @@ def completions(req: ChatCompletionRequest):
         try:
             res = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=distilled_prompt
+                contents=beautified
             )
             out = "*[Simple Task: Gemini 2.5 Flash]*\n\n" + (res.text or "")
             return package_response(req.model, out)
@@ -293,5 +386,5 @@ def completions(req: ChatCompletionRequest):
             print(f"Gemini simple generation error: {e}")
 
     # Fallback / Default local Ollama (qwen2.5-coder:7b)
-    ollama_out = call_ollama_generation(distilled_prompt)
+    ollama_out = call_ollama_generation(beautified)
     return package_response(req.model, "*[Simple Task: Local Ollama]*\n\n" + ollama_out)
