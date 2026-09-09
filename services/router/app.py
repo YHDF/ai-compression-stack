@@ -155,6 +155,25 @@ def healthz():
         }
     )
 
+@app.get("/v1/models")
+@app.get("/models")
+def list_models():
+    """Exposes OpenAI-compatible model registry for Open WebUI discovery."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "auto-router",
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "local-compression-stack",
+                "permission": [],
+                "root": "auto-router",
+                "parent": None
+            }
+        ]
+    }
+
 def read_target_files(target_files: List[str]) -> str:
     """Router Pre-Reader: Ingests matching target files from /workspace, filtering >50KB and non-code/logs."""
     if not target_files or not os.path.exists(WORKSPACE_DIR):
