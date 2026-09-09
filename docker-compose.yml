@@ -21,10 +21,15 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - HOME=/root
       - OLLAMA_URL=http://ollama:11434
       - HEADROOM_PROXY=http://headroom:8787
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:7b}
+    volumes:
+      - ${AGY_BIN_PATH:-~/.local/bin/agy}:/usr/local/bin/agy:ro
+      - ${HOST_LOCAL_PATH:-~/.local}:/root/.local:ro
+      - ${HOST_CONFIG_PATH:-~/.config}:/root/.config:ro
     depends_on:
       - ollama
       - headroom
