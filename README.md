@@ -113,7 +113,17 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
 ## Key Features
 
 - **Upfront Workspace Auto-Discovery**: Prompt in plain English (e.g. `@coder Add user authentication`) without manually listing file paths. Local Ollama automatically detects the target files from `/workspace` file tree at **0 cloud tokens**.
-- **AST Code Compression Engine (`ast_compressor.py`)**: Automatically minifies target code (Python AST docstring & comment removal, whitespace pruning, compact JSON) before passing context to `agy`, achieving **30%–55% token reductions**.
+- **Multi-Format Code Compression Engine (`ast_compressor.py`)**: Automatically minifies target context across multiple languages and data formats before passing context to `agy`, slashing token consumption by **25% to 55%**:
+  - **Python (`.py`)**: AST-based docstring, comment, and whitespace minification.
+  - **JS / TS / C / C++ / Java / Go / Rust / C# / PHP (`.js`, `.ts`, `.jsx`, `.tsx`, `.c`, `.cpp`, `.go`, `.rs`, `.java`, `.cs`, `.php`, `.vue`, `.svelte`)**: String-aware comment stripping (`//`, `/* */`) and blank line elimination.
+  - **JSON (`.json`)**: Whitespace and newline minification.
+  - **HTML / XML / SVG (`.html`, `.htm`, `.xml`, `.svg`)**: Comment (`<!-- -->`) removal and tag-gap collapsing.
+  - **CSS / SCSS / SASS (`.css`, `.scss`, `.sass`, `.less`)**: Comment stripping and whitespace compression.
+  - **YAML (`.yaml`, `.yml`)**: Comment stripping with strict indentation structure preservation.
+  - **Shell Scripts (`.sh`, `.bash`, `.zsh`)**: Comment stripping with shebang (`#!`) preservation.
+  - **SQL (`.sql`)**: Single-line (`--`) and block (`/* */`) comment stripping.
+  - **Tabular Data (`.csv`, `.tsv`)**: Compacts whitespace and auto-truncates large datasets to representative schema samples.
+  - **Markdown (`.md`, `.mdx`, `.txt`)**: Comment removal and excessive blank line compaction.
 - **In-Flight Zero-Cost MCP Tools (`mcp_workspace.py`)**:
   - `write_to_file`: Headless file creations and non-destructive edits.
   - `run_command`: Sandboxed command runner (`/bin/bash`, `stdin=DEVNULL`, 64KB capped output, 120s timeout).
@@ -172,7 +182,9 @@ Customize these variables in your `.env` file:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `AGY_MODEL` | `gpt-oss-120b-medium` | Model target used by Antigravity CLI (`agy --model`). |
+| `AGY_TIMEOUT` | `180` | Subprocess execution and print timeout in seconds for `agy`. |
 | `OLLAMA_MODEL` | `qwen2.5-coder:0.5b` | Model used for local file discovery, MCP assistance, and offline fallback. |
+| `OLLAMA_TIMEOUT` | `35` | Timeout in seconds for local Ollama dependency discovery and analysis. |
 | `PORT_ROUTER` | `8088` | Host port exposed for the Quota Router Gateway. |
 | `HOST_UID` | `1000` | Host user ID mapped into the container. |
 | `HOST_GID` | `1000` | Host group ID mapped into the container. |
@@ -211,6 +223,46 @@ curl -s -X POST http://localhost:8088/v1/chat/completions \
     ]
   }'
 ```
+
+### 4. Recommended Prompt Templates (Open WebUI)
+
+To maximize AST compression, guarantee instant file pre-reading, and prevent agent search loops or timeouts, use this structured prompt pattern:
+
+#### Universal Template (Copy & Fill)
+````markdown
+@[coder|reviewer|architect]
+Target Files: [relative/path/to/target_file.ext]
+
+Task:
+[One-sentence summary of the task]
+
+Specification:
+- In `[target_file]`, locate `[function_or_code_block]`.
+- Modify/implement [exact behavior change or requirement].
+- Output / Return behavior: [data types, return value, or format].
+
+Constraints:
+- Produce minimal targeted diffs; preserve untouched code and formatting.
+- Verify syntax and run tests if present.
+````
+
+#### Example (Sample Task)
+````markdown
+@coder
+Target Files: services/auth/token_manager.py
+
+Task:
+Add automatic expiration validation to the session token decoder.
+
+Specification:
+- In `services/auth/token_manager.py`, locate the `verify_session()` function.
+- Check if `payload["exp"]` is older than the current UTC timestamp.
+- If expired, raise a `TokenExpiredException("Session token has expired")`.
+
+Constraints:
+- Do not modify existing cryptographic signature checks.
+- Run `pytest tests/test_token_manager.py` to confirm tests pass.
+````
 
 ---
 

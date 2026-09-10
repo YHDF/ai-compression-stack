@@ -129,6 +129,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
     ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b")
+    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "45"))
 
     system_prompt = (
         "You are an embedded repository intelligence engine assisting a principal software engineer. "
@@ -155,7 +156,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=ollama_timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             answer = data.get("response", "").strip()
 

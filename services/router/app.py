@@ -16,7 +16,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b").strip()
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "35"))
 AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
+AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "180"))
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
@@ -307,6 +309,7 @@ def discover_relevant_files(prompt: str) -> List[str]:
         if os.path.isfile(full_p):
             valid_explicit.append(f)
     if valid_explicit:
+        print(f"[ROUTER] Explicit target file(s) matched: {valid_explicit}", flush=True)
         return valid_explicit
 
     # 2. Collect code/config files in workspace (hierarchical scan)
@@ -316,29 +319,36 @@ def discover_relevant_files(prompt: str) -> List[str]:
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("venv", "env", "__pycache__", "node_modules", "dist", "build", ".git")]
         for fn in filenames:
             ext = os.path.splitext(fn)[1].lower()
-            if ext in (".py", ".json", ".yaml", ".yml", ".md", ".sh", ".sql", ".toml", ".ini", ".cfg", ".ts", ".js", ".html", ".css"):
+            if ext in (
+                ".py", ".json", ".yaml", ".yml", ".md", ".mdx", ".sh", ".bash", ".zsh",
+                ".sql", ".toml", ".ini", ".cfg", ".ts", ".js", ".jsx", ".tsx", ".mjs", ".cjs",
+                ".html", ".htm", ".xml", ".svg", ".css", ".scss", ".sass", ".less",
+                ".csv", ".tsv", ".go", ".rs", ".java", ".c", ".cpp", ".cc", ".h", ".hpp", ".cs", ".php", ".vue", ".svelte"
+            ):
                 rel = os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/")
                 workspace_files.append(rel)
 
     if not workspace_files:
         return []
 
-    # If small project, consider all files
-    if len(workspace_files) <= 4:
+    # Single-file workspace needs no disambiguation
+    if len(workspace_files) == 1:
         return workspace_files
 
-    # 3. For larger projects, score candidates using prompt keywords to avoid context overflow
-    prompt_tokens = set(w.lower() for w in words if len(w) > 2)
+    # 3. For multi-file projects, score candidates using prompt keywords to avoid context overflow
+    prompt_tokens = set(w.lower().replace("-", "").replace("_", "") for w in words if len(w) > 2)
     scored = []
     for f in workspace_files:
-        f_lower = f.lower()
-        score = sum(2 for t in prompt_tokens if t in os.path.basename(f_lower)) + sum(1 for t in prompt_tokens if t in f_lower)
+        f_norm = f.lower().replace("-", "").replace("_", "")
+        base_norm = os.path.basename(f).lower().replace("-", "").replace("_", "")
+        score = sum(2 for t in prompt_tokens if t in base_norm) + sum(1 for t in prompt_tokens if t in f_norm)
         scored.append((score, f))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     candidate_files = [f for _, f in scored[:30]]
 
     # 4. Query local Ollama (0 cloud tokens) to select the essential working set
+    print(f"[ROUTER] Asking Ollama ({OLLAMA_MODEL}) to select relevant files from {len(candidate_files)} candidates...", flush=True)
     try:
         query_prompt = (
             "You are an embedded codebase dependency analyzer.\n"
@@ -353,9 +363,10 @@ def discover_relevant_files(prompt: str) -> List[str]:
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": query_prompt,
+                "format": "json",
                 "stream": False
             },
-            timeout=15
+            timeout=OLLAMA_TIMEOUT
         )
         if res.status_code == 200:
             ans = res.json().get("response", "").strip()
@@ -364,12 +375,17 @@ def discover_relevant_files(prompt: str) -> List[str]:
             if m:
                 chosen = json.loads(m.group(0))
                 if isinstance(chosen, list):
-                    return [f for f in chosen if f in workspace_files]
+                    filtered = [f for f in chosen if f in workspace_files]
+                    if filtered:
+                        print(f"[ROUTER] Ollama selected target files: {filtered}", flush=True)
+                        return filtered
     except Exception as e:
-        print(f"Notice: Ollama auto-discovery fallback: {e}")
+        print(f"Notice: Ollama auto-discovery fallback: {e}", flush=True)
 
     # Fallback to top scored keyword matches
-    return [f for s, f in scored[:3] if s > 0]
+    fallback_matches = [f for s, f in scored[:3] if s > 0]
+    print(f"[ROUTER] Keyword scoring selected files: {fallback_matches}", flush=True)
+    return fallback_matches
 
 def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     """Enforce architectural boundaries on agy to prevent multi-turn search loops and preserve token quota."""
@@ -399,7 +415,8 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         "--model", AGY_MODEL,
         "--add-dir", WORKSPACE_DIR,
         "--mode", "accept-edits",
-        "--dangerously-skip-permissions"
+        "--dangerously-skip-permissions",
+        "--print-timeout", f"{AGY_TIMEOUT}s"
     ]
     if agent_id:
         cmd.extend(["--agent", agent_id])
@@ -440,7 +457,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
             cmd,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=AGY_TIMEOUT,
             env=env,
             cwd=cwd
         )
@@ -458,7 +475,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
 
         return output if output else "Task completed successfully."
     except subprocess.TimeoutExpired:
-        print("agy execution timed out (180s)", flush=True)
+        print(f"agy execution timed out ({AGY_TIMEOUT}s)", flush=True)
         return None
     except Exception as e:
         print(f"agy subprocess execution error: {e}", flush=True)
