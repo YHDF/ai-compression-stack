@@ -15,7 +15,7 @@ app = FastAPI(title="Local AI Context-Router & Compression Stack")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b").strip()
 AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
@@ -195,6 +195,7 @@ def list_models():
         ("coder", "Antigravity Coder: minimal-diff implementation & tests"),
         ("reviewer", "Antigravity Reviewer: security & quality auditor"),
         ("architect", "Antigravity Architect: system design & roadmap planner"),
+        ("headroom-proxy", "Headroom Compression Proxy (Direct upstream pass-through)")
     ]
     return {
         "object": "list",
@@ -213,13 +214,38 @@ def list_models():
         ]
     }
 
+@app.get("/stats")
+def stats():
+    """Aggregate token compression statistics from AST engine and Headroom proxy."""
+    try:
+        from ast_compressor import get_stats
+        ast_stats = get_stats()
+    except Exception as e:
+        ast_stats = {"error": str(e)}
+
+    headroom_stats = {}
+    try:
+        r = requests.get(f"{HEADROOM_PROXY}/stats", timeout=3)
+        if r.status_code == 200:
+            headroom_stats = r.json()
+    except Exception as e:
+        headroom_stats = {"error": f"Headroom unreachable: {e}"}
+
+    return {
+        "ast_compression": ast_stats,
+        "headroom_proxy": headroom_stats
+    }
+
+MAX_TOTAL_PRE_READ_SIZE = 40 * 1024  # 40 KB cumulative budget
+
 def read_target_files(target_files: List[str]) -> str:
-    """Router Pre-Reader: Ingests matching target files from /workspace, filtering >50KB and non-code/logs."""
+    """Router Pre-Reader: Ingests matching target files from /workspace under a cumulative size budget."""
     if not target_files or not os.path.exists(WORKSPACE_DIR):
         return ""
 
     context_blocks = []
     workspace_root = os.path.abspath(WORKSPACE_DIR)
+    total_bytes = 0
 
     for raw_path in target_files:
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -233,30 +259,33 @@ def read_target_files(target_files: List[str]) -> str:
             abs_path = os.path.abspath(os.path.join(workspace_root, clean_path))
 
         # Security check: avoid directory traversal outside workspace
-        if not abs_path.startswith(workspace_root):
-            print(f"Notice: Path outside workspace rejected: {clean_path}")
-            continue
-
-        if not os.path.isfile(abs_path):
+        if not abs_path.startswith(workspace_root) or not os.path.isfile(abs_path):
             continue
 
         ext = os.path.splitext(abs_path)[1].lower()
         if ext in IGNORED_EXTENSIONS or "log" in os.path.basename(abs_path).lower():
-            print(f"Notice: Non-code/log file skipped: {clean_path}")
             continue
 
         try:
             file_size = os.path.getsize(abs_path)
-            if file_size > MAX_PRE_READ_SIZE:
-                print(f"Notice: Oversized file skipped ({file_size} > 50KB): {clean_path}")
+            if file_size > MAX_PRE_READ_SIZE or (total_bytes + file_size > MAX_TOTAL_PRE_READ_SIZE):
                 continue
 
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
 
-            rel_path = os.path.relpath(abs_path, workspace_root)
+            rel_path = os.path.relpath(abs_path, workspace_root).replace("\\", "/")
             lang = ext.lstrip(".") if ext else "text"
-            context_blocks.append(f"### File: {rel_path}\n```{lang}\n{content}\n```")
+            
+            try:
+                from ast_compressor import compress_code_snippet
+                comp_content, orig_t, comp_t = compress_code_snippet(content, filename=rel_path)
+                saved_pct = int((orig_t - comp_t) / orig_t * 100) if orig_t > comp_t else 0
+                tag = f" (AST Compressed: -{saved_pct}% tokens)" if saved_pct > 0 else ""
+                context_blocks.append(f"### File: {rel_path}{tag}\n```{lang}\n{comp_content}\n```")
+            except Exception:
+                context_blocks.append(f"### File: {rel_path}\n```{lang}\n{content}\n```")
+            total_bytes += file_size
         except Exception as e:
             print(f"Notice: Error reading file {abs_path}: {e}")
 
@@ -264,37 +293,98 @@ def read_target_files(target_files: List[str]) -> str:
         return "## Workspace Pre-Read Context:\n" + "\n\n".join(context_blocks)
     return ""
 
+def discover_relevant_files(prompt: str) -> List[str]:
+    """Auto-discover relevant workspace files using keyword matching or local Ollama dependency analysis."""
+    if not os.path.exists(WORKSPACE_DIR):
+        return []
+
+    # 1. Check if user explicitly mentioned file paths in prompt
+    words = prompt.replace("`", " ").replace('"', ' ').replace("'", " ").replace(",", " ").split()
+    explicit = [w for w in words if "." in w and not w.startswith("@") and not w.startswith("/") and not w.endswith(".")]
+    valid_explicit = []
+    for f in explicit:
+        full_p = os.path.join(WORKSPACE_DIR, f)
+        if os.path.isfile(full_p):
+            valid_explicit.append(f)
+    if valid_explicit:
+        return valid_explicit
+
+    # 2. Collect code/config files in workspace (hierarchical scan)
+    workspace_files = []
+    root = os.path.abspath(WORKSPACE_DIR)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("venv", "env", "__pycache__", "node_modules", "dist", "build", ".git")]
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in (".py", ".json", ".yaml", ".yml", ".md", ".sh", ".sql", ".toml", ".ini", ".cfg", ".ts", ".js", ".html", ".css"):
+                rel = os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/")
+                workspace_files.append(rel)
+
+    if not workspace_files:
+        return []
+
+    # If small project, consider all files
+    if len(workspace_files) <= 4:
+        return workspace_files
+
+    # 3. For larger projects, score candidates using prompt keywords to avoid context overflow
+    prompt_tokens = set(w.lower() for w in words if len(w) > 2)
+    scored = []
+    for f in workspace_files:
+        f_lower = f.lower()
+        score = sum(2 for t in prompt_tokens if t in os.path.basename(f_lower)) + sum(1 for t in prompt_tokens if t in f_lower)
+        scored.append((score, f))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    candidate_files = [f for _, f in scored[:30]]
+
+    # 4. Query local Ollama (0 cloud tokens) to select the essential working set
+    try:
+        query_prompt = (
+            "You are an embedded codebase dependency analyzer.\n"
+            f"Candidate project files:\n{json.dumps(candidate_files)}\n\n"
+            f"Task: '{prompt}'\n\n"
+            "Return strictly a JSON array of the file paths directly implicated by this task. "
+            "Order by relevance, starting with the primary target. Exclude peripheral or unaffected files.\n"
+            "JSON:"
+        )
+        res = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": query_prompt,
+                "stream": False
+            },
+            timeout=15
+        )
+        if res.status_code == 200:
+            ans = res.json().get("response", "").strip()
+            import re
+            m = re.search(r"\[.*?\]", ans, re.DOTALL)
+            if m:
+                chosen = json.loads(m.group(0))
+                if isinstance(chosen, list):
+                    return [f for f in chosen if f in workspace_files]
+    except Exception as e:
+        print(f"Notice: Ollama auto-discovery fallback: {e}")
+
+    # Fallback to top scored keyword matches
+    return [f for s, f in scored[:3] if s > 0]
+
 def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
-    """Enforce operational boundaries on agy to prevent multi-turn search loops and quota exhaustion."""
+    """Enforce architectural boundaries on agy to prevent multi-turn search loops and preserve token quota."""
     guardrails = (
         "## Operational Boundaries & Guardrails:\n"
-        "- Scope: Modify strictly the specified target files in the workspace.\n"
-        "- Safeguards: DO NOT trigger unbounded recursive directory scans, multi-turn web search loops, or unrelated edits.\n"
-        "- Output: Maintain concise diffs and clear summaries.\n\n"
+        "- Scope: Modify strictly the files required to fulfill the specification.\n"
+        "- Fast Convergence: Consolidate actions. Execute batch operations (e.g. batch deletions or multi-file edits) in a single turn. Complete execution in 2 turns maximum.\n"
+        "- Token Economy: Leverage pre-read context; avoid redundant disk scans or serial tool iterations.\n"
+        "- Output: Maintain minimal, clean diffs with high-fidelity verification.\n\n"
     )
     parts = [guardrails]
     if context_str:
         parts.append(context_str + "\n\n")
     parts.append(f"## Architectural Task Specification:\n{beautified_prompt}")
     return "".join(parts)
-
-def compress_prompt(prompt: str) -> str:
-    """Strip AST/JSON bloat via Headroom proxy before execution."""
-    try:
-        payload = {
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-        res = requests.post(f"{HEADROOM_PROXY}/v1/compress", json=payload, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            compressed = data.get("compressed_prompt") or data.get("content")
-            if compressed:
-                return compressed
-    except Exception as e:
-        print(f"Headroom compression bypassed: {e}")
-    return prompt
 
 def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optional[str]:
     """Execute agy CLI non-interactively with active AGY_MODEL, optional persona agent, and workspace cwd."""
@@ -350,7 +440,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
             env=env,
             cwd=cwd
         )
@@ -368,7 +458,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
 
         return output if output else "Task completed successfully."
     except subprocess.TimeoutExpired:
-        print("agy execution timed out (120s)", flush=True)
+        print("agy execution timed out (180s)", flush=True)
         return None
     except Exception as e:
         print(f"agy subprocess execution error: {e}", flush=True)
@@ -407,10 +497,29 @@ def completions(req: ChatCompletionRequest):
         agent_id = "coder"
         clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
 
+    # Direct Headroom Proxy Route
+    if "headroom" in req.model.lower():
+        try:
+            headroom_req = req.model_dump()
+            headroom_res = requests.post(f"{HEADROOM_PROXY}/v1/chat/completions", json=headroom_req, timeout=60)
+            if headroom_res.status_code == 200:
+                return headroom_res.json()
+            return JSONResponse(status_code=headroom_res.status_code, content=headroom_res.json())
+        except Exception as e:
+            return package_response(req.model, f"*[Headroom Proxy Error]*\n\n{e}")
+
     if agent_id:
-        agy_output = execute_agy(clean_prompt or prompt_text, agent_id=agent_id)
+        # Pre-read referenced or auto-discovered workspace files and AST-compress them
+        target_files = discover_relevant_files(clean_prompt or prompt_text)
+        ws_context = read_target_files(target_files) if target_files else ""
+
+        prepared = (ws_context + "\n\n" + clean_prompt) if ws_context else (clean_prompt or prompt_text)
+        agy_output = execute_agy(prepared, agent_id=agent_id)
         if agy_output is not None:
-            badge = f"*[Agent Task: {agent_id.capitalize()} ({AGY_MODEL})]*\n\n"
+            from ast_compressor import get_stats
+            s = get_stats()
+            saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
+            badge = f"*[Agent Task: {agent_id.capitalize()} ({AGY_MODEL}){saved_str}]*\n\n"
             return package_response(req.model, badge + agy_output)
 
         # Automatic fallback to local Ollama on failure/timeout
@@ -462,9 +571,9 @@ def completions(req: ChatCompletionRequest):
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": (
-                    "Convert this user coding request into a clean, concise, and structured architectural engineering specification. "
-                    "Eliminate informal chatter, slang, or noise. Classify whether it requires an interactive complex agent, "
-                    f"and isolate exact target file paths:\n\n{prompt_text}"
+                    "You are a technical requirements synthesizer. Convert this user request into a precise, structured architectural specification. "
+                    "Eliminate conversational chatter, slang, and ambiguity. Identify whether it requires multi-step autonomous execution, "
+                    f"and list any directly referenced target file paths:\n\n{prompt_text}"
                 ),
                 "format": structured_schema,
                 "stream": False
@@ -485,16 +594,19 @@ def completions(req: ChatCompletionRequest):
 
     # 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
     if is_complex:
-        # Pre-read matching files from workspace
+        # Discover and pre-read matching files from workspace
+        if not target_files:
+            target_files = discover_relevant_files(beautified)
         context_str = read_target_files(target_files)
         # Apply anti-hallucination & quota safeguards
         guarded_prompt = apply_guardrails(beautified, context_str)
-        # Strip AST / boilerplate bloat via Headroom
-        compressed_prompt = compress_prompt(guarded_prompt)
 
-        agy_output = execute_agy(compressed_prompt)
+        agy_output = execute_agy(guarded_prompt)
         if agy_output is not None:
-            out = f"*[Agent Task: Headroom + Antigravity ({AGY_MODEL})]*\n\n" + agy_output
+            from ast_compressor import get_stats
+            s = get_stats()
+            saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
+            out = f"*[Agent Task: Antigravity ({AGY_MODEL}){saved_str}]*\n\n" + agy_output
             return package_response(req.model, out)
 
         # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama

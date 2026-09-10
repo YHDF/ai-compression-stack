@@ -53,7 +53,9 @@ services:
       - "3000:8080"
     environment:
       - OPENAI_API_BASE_URL=http://router:8000/v1
+      - OPENAI_API_BASE_URLS=http://router:8000/v1;http://headroom:8787/v1
       - OPENAI_API_KEY=local-dev
+      - OPENAI_API_KEYS=local-dev;local-dev
     volumes:
       - webui_data:/app/backend/data
     depends_on:
