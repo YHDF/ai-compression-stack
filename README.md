@@ -1,6 +1,6 @@
 # AI Compression Stack
 
-A fully open-source, containerized context-routing and compression stack designed to preserve upstream LLM token quotas, eliminate vendor lock-in, and provide automated agent dispatch.
+A containerized context-routing, multi-agent dispatch, and compression stack designed to preserve upstream LLM token quotas, eliminate vendor lock-in, and provide automated agent personas.
 
 Incoming requests to the OpenAI-compatible gateway are analyzed, distilled via local models (Ollama), stripped of AST/JSON bloat using Headroom, and executed via Antigravity (`agy` CLI) or local Ollama with zero required cloud API keys.
 
@@ -9,47 +9,56 @@ Incoming requests to the OpenAI-compatible gateway are analyzed, distilled via l
 ## Architecture & Workflow
 
 ```
-User Prompt (Messy / Informal)
+User Prompt (Open WebUI / API)
+           │
+           ├── [Persona Mention / Trigger?]
+           │     ├── @coder / /coder         ──► Dispatches agy --agent coder
+           │     ├── @reviewer / /reviewer   ──► Dispatches agy --agent reviewer
+           │     └── @architect / /architect ──► Dispatches agy --agent architect
            │
            ▼
 [ Ollama: Beautify & Structure Pass ]
-  - Converts prompt to clean architectural task
-  - Pinpoints specific files & dependencies
+   - Converts prompt to structured engineering specification
+   - Isolate file dependencies and evaluates complexity
            │
-           ▼
+           ├── Simple Task ──► Direct Local Ollama Generation (or Gemini Flash)
+           │
+           ▼ (Complex Task)
 [ Router Pre-Reader & Filter ]
-  - Gathers referenced files from codebase
-  - Rejects oversized files (>50KB) or non-code logs
+   - Ingests referenced files from /workspace (rejects >50KB & non-code logs)
            │
            ▼
 [ Headroom Compression Proxy ]
-  - Prunes AST boilerplate & repetitive syntax bloat
+   - Prunes AST boilerplate, syntax repetition, and JSON bloat (:8787)
            │
            ▼
 [ Guardrail Wrapper + agy Dispatch ]
-  - Appends strict execution constraints
-  - Dispatches non-interactively via `agy -p ...`
+   - Subprocess agy --model <AGY_MODEL> --add-dir /workspace --dangerously-skip-permissions
+   - Outgoing provider traffic routed through Headroom proxy
            │
            ▼
 [ Execution or Local Fallback ]
-  - Emits clean OpenAI response envelope
-  - Automatic fallback to local Ollama on failure/timeout
+   - Exit 0: Emits clean OpenAI response envelope
+   - Non-zero / Timeout / 429 Quota: Automatic fallback to local Ollama
 ```
 
-### Detailed Flowchart
+### Flowchart
 
 ```mermaid
 flowchart TD
-    Client(["User Prompt (Messy / Informal)<br>Open-WebUI :3000"]) -->|POST /v1/chat/completions| Router["Quota Router Gateway<br>FastAPI :8000"]
+    Client(["User Prompt<br>Open-WebUI :3000"]) -->|POST /v1/chat/completions| Router["Quota Router Gateway<br>FastAPI :8000 (Host :8088)"]
 
-    Router --> CheckVision{"Multimodal / Image?"}
+    Router --> CheckPersona{"Persona Trigger?<br>@coder / @reviewer / @architect"}
+    CheckPersona -->|Yes| DispatchPersona["Dispatch agy --agent &lt;persona&gt;<br>--model claude-3-7-sonnet"]
+
+    CheckPersona -->|No| CheckVision{"Multimodal / Image?"}
     CheckVision -->|Yes| GeminiVision["Gemini 2.5 Flash / Vision Fallback"]
 
     CheckVision -->|No| OllamaPass["1. Ollama: Beautify & Structure Pass<br>• Clean architectural task<br>• Pinpoint file dependencies"]
     
     OllamaPass --> Classify{"is_complex_agent?"}
 
-    Classify -->|False: Simple Task| SimpleOllama["Direct Code Generation<br>qwen2.5-coder:7b"]
+    Classify -->|False: Simple Task| SimpleOllama["Direct Code Generation<br>Local Ollama"]
 
     Classify -->|True: Agent Task| PreReader["2. Router Pre-Reader<br>• Inspect referenced files<br>• Filter files > 50KB & non-code logs"]
 
@@ -58,7 +67,9 @@ flowchart TD
     Headroom --> Guardrails["4. Guardrail Wrapper + agy Dispatch<br>• Attach strict constraints<br>• Subprocess agy --dangerously-skip-permissions"]
 
     Guardrails --> CheckStatus{"agy Result Code"}
-    CheckStatus -->|Exit 0| AgentSuccess["*[Agent Task: Headroom + Antigravity]*"]
+    DispatchPersona --> CheckStatus
+
+    CheckStatus -->|Exit 0| AgentSuccess["*[Agent Task: Antigravity]*"]
     CheckStatus -->|Non-Zero / Quota / Timeout| FallbackOllama["*[Fallback: Local Ollama]*<br>Local Model Code Gen"]
 
     GeminiVision --> Envelope["OpenAI-Compatible Response Envelope"]
@@ -74,22 +85,40 @@ flowchart TD
 
 The stack is composed of 4 containerized services managed via `docker-compose.yml`:
 
-| Service | Container Name | Port | Description |
-| :--- | :--- | :--- | :--- |
-| **`router`** | `quota-router` | `8000` | FastAPI gateway providing an OpenAI-compatible `/v1/chat/completions` API and health probes. Manages distillation, compression calls, and non-interactive `agy` dispatch. |
-| **`headroom`** | `headroom-proxy` | `8787` | Context compression proxy utilizing `headroom-ai` to strip JSON/AST and multi-turn bloat before execution. |
-| **`ollama`** | `local-ollama` | `11434` | Local model inference engine serving `qwen2.5-coder:7b` for prompt distillation, classification, and offline fallback code generation. |
-| **`open-webui`** | `open-webui` | `3000` | Full-featured chat interface wired to `http://router:8000/v1` as an OpenAI backend. |
+| Service | Container Name | Host Port | Internal Port | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **`router`** | `quota-router` | `8088` | `8000` | FastAPI gateway providing OpenAI-compatible `/v1/chat/completions`, model registry, persona dispatch, and cold-start fallback. |
+| **`headroom`** | `headroom-proxy` | `8787` | `8787` | Context compression proxy utilizing `headroom-ai` to strip JSON/AST and multi-turn bloat before execution. |
+| **`ollama`** | `local-ollama` | `11434` | `11434` | Local model inference engine (`qwen2.5-coder:1.5b`) for prompt distillation, classification, and offline fallback. |
+| **`open-webui`** | `open-webui` | `3000` | `8080` | Full-featured chat interface wired to `http://router:8000/v1` with native model/persona autocompletion. |
+
+---
+
+## Multi-Agent Personas
+
+The stack natively supports specialized personas declared in `.antigravity/agents/`:
+
+| Persona | Triggers | Description |
+| :--- | :--- | :--- |
+| **`coder`** | `@coder`, `/coder`, `@dev`, `@implement` | Senior Software Engineer & Implementation Specialist: minimal-diff coding, bug fixes, test-driven validation strictly within `/workspace`. |
+| **`reviewer`** | `@reviewer`, `/reviewer`, `@audit` | Senior Security and Quality Auditor: inspects code for vulnerabilities, edge-case bugs, missing error branches, and suggests minimal patches. |
+| **`architect`** | `@architect`, `/architect` | System Architect: pre-implementation blueprints, interface contracts, and phased technical implementation roadmaps. |
+
+### Global Directives (`AGENTS.md`)
+The project root includes [AGENTS.md](AGENTS.md) enforcing:
+- Operational scope restricted exclusively to `/workspace`.
+- Mandatory pre-reading before modifying code.
+- Non-destructive, minimal-diff editing practices.
 
 ---
 
 ## Key Features
 
-- **100% Keyless Agent Dispatch**: Mounts host authentication credentials (`~/.config`, `~/.local`) and the `agy` binary directly into the router container, utilizing existing developer CLI sessions without needing API keys.
-- **Dynamic & Portable Mounts**: Uses Docker Compose tilde (`~`) and environment variable expansion (`${AGY_BIN_PATH:-~/.local/bin/agy}`) so no personal usernames or system-specific paths are tracked in Git.
-- **Intelligent Context Distillation**: Prompts are passed through Ollama with a strict JSON schema to isolate dependencies and classify whether a request requires tool execution or standard completion.
-- **Headroom Compression Layer**: Eliminates token bloat prior to running multi-file coding agent tasks, keeping token consumption within rate limits.
-- **Automated Fallback Pipeline**: If `agy` encounters a non-zero exit code, times out (180s limit), or hits rate limits, the request automatically falls back to local Ollama code generation without failing the user's request.
+- **Multi-Agent Persona Dispatching**: Select personas from Open WebUI's model dropdown or trigger them inline via `@coder`, `@reviewer`, or `@architect`.
+- **100% Abstract & Portable**: Uses native `~` volume expansion on the host and standardized `/home/appuser` inside the container. Works seamlessly across Linux, macOS, and Windows WSL with zero hardcoded usernames.
+- **Headroom Compression Proxy**: Routes outgoing provider traffic (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `HTTP_PROXY`) through Headroom to compress prompts and prune repetitive AST bloat.
+- **Quota & Timeout Protection**: Automatically catches CLI 429 quota limits, rate limits, or cold-start timeouts and fails over to local Ollama in real time without failing user requests.
+- **Live Logging Visibility**: Real-time unbuffered log emission `[ROUTER] Target: ...` in Docker logs for full observability of dispatch decisions.
 
 ---
 
@@ -97,9 +126,9 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 
 ### Prerequisites
 - [Docker](https://docs.docker.com/get-docker/) & Docker Compose v2+
-- Linux or WSL2 (Windows Subsystem for Linux)
+- Linux, macOS, or Windows WSL2
 - [Antigravity CLI](https://github.com/google/antigravity) (`agy`) installed and logged in on the host (defaults to `~/.local/bin/agy`)
-- Ollama model `qwen2.5-coder:7b` (pulled automatically or via `docker exec -it local-ollama ollama pull qwen2.5-coder:7b`)
+- Ollama model (defaults to `qwen2.5-coder:1.5b`)
 
 ### Quickstart
 
@@ -109,11 +138,11 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
    cd ai-compression-stack
    ```
 
-2. **Configure environment variables (optional):**
+2. **Configure environment variables:**
    ```bash
    cp .env.example .env
    ```
-   *(All defaults work out of the box with zero API keys required).*
+   *(All defaults work out of the box with zero required API keys).*
 
 3. **Build and launch the stack:**
    ```bash
@@ -122,7 +151,7 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 
 4. **Verify health connectivity:**
    ```bash
-   curl -i http://localhost:8000/healthz
+   curl -i http://localhost:8088/healthz
    ```
 
 5. **Access the Open-WebUI Frontend:**
@@ -132,61 +161,49 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 
 ## Configuration Reference
 
-Set these variables in your `.env` file to customize host paths or models:
+Customize these variables in your `.env` file:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Model used for local distillation, simple tasks, and fallbacks. |
-| `GEMINI_API_KEY` | *(empty)* | Optional Gemini API key. If empty, all tasks default to Ollama / local `agy` session. |
-| `AGY_BIN_PATH` | `~/.local/bin/agy` | Custom host path to the `agy` CLI binary. |
-| `HOST_LOCAL_PATH` | `~/.local` | Custom host path to `.local` directory (keyrings / auth). |
-| `HOST_CONFIG_PATH` | `~/.config` | Custom host path to `.config` directory (CLI configurations). |
+| `AGY_MODEL` | `claude-3-7-sonnet` | Model target used by Antigravity CLI (`agy --model`). |
+| `OLLAMA_MODEL` | `qwen2.5-coder:1.5b` | Model used for local distillation, simple tasks, and offline fallback. |
+| `PORT_ROUTER` | `8088` | Host port exposed for the Quota Router Gateway. |
+| `HOST_UID` | `1000` | Host user ID mapped into the container. |
+| `HOST_GID` | `1000` | Host group ID mapped into the container. |
+| `WORKSPACE_PATH` | `~/development` | Host path bind-mounted to `/workspace` inside containers. |
+| `AGY_BIN_PATH` | `~/.local/bin/agy` | Host path to the `agy` CLI binary. |
+| `HOST_LOCAL_PATH` | `~/.local` | Host path to `.local` directory (keyrings / auth). |
+| `HOST_CONFIG_PATH` | `~/.config` | Host path to `.config` directory (CLI configurations). |
+| `HOST_GEMINI_PATH` | `~/.gemini` | Host path to `.gemini` directory (installation ID & session tokens). |
 | `HEADROOM_PROXY` | `http://headroom:8787` | Internal Docker URL for the Headroom proxy service. |
 | `OLLAMA_URL` | `http://ollama:11434` | Internal Docker URL for the Ollama service. |
+| `GEMINI_API_KEY` | *(empty)* | Optional Gemini API key. If omitted, routes via Ollama / `agy`. |
 
 ---
 
-## API Testing
+## Usage & API Testing
 
-### 1. Simple Task (Local Ollama / Gemini)
+### 1. Persona Prompts in Open WebUI
+In [http://localhost:3000](http://localhost:3000), select `auto-router` (or any persona model) and type:
+- `@coder Implement a retry loop with exponential backoff for the HTTP client`
+- `@reviewer Check router/app.py for unhandled exceptions and security risks`
+- `@architect Design a modular plugin architecture for the compression router`
+
+### 2. OpenAI-Compatible API Call
 ```bash
-curl -s -X POST http://localhost:8000/v1/chat/completions \
+curl -s -X POST http://localhost:8088/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "auto-router",
+    "model": "coder",
     "messages": [
-      {"role": "user", "content": "Write a Python quicksort function"}
-    ]
-  }'
-```
-
-### 2. Complex Agent Task (Distillation -> Headroom -> `agy` Dispatch)
-```bash
-curl -s -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "auto-router",
-    "messages": [
-      {"role": "user", "content": "Refactor the database queries across all files"}
+      {"role": "user", "content": "Write unit tests for the token counter"}
     ]
   }'
 ```
 
 ### 3. Health Check
 ```bash
-curl -s http://localhost:8000/healthz
-```
-Expected response:
-```json
-{
-  "status": "ok",
-  "services": {
-    "ollama": "reachable",
-    "headroom": "reachable"
-  },
-  "ollama_url": "http://ollama:11434",
-  "headroom_proxy": "http://headroom:8787"
-}
+curl -s http://localhost:8088/healthz
 ```
 
 ---

@@ -26,9 +26,15 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
       - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:1.5b}
       - HEADROOM_PROXY=http://headroom:8787
+      - AGY_MODEL=${AGY_MODEL:-claude-3-7-sonnet}
+      - ANTHROPIC_BASE_URL=http://headroom:8787
+      - OPENAI_BASE_URL=http://headroom:8787/v1
+      - HTTP_PROXY=http://headroom:8787
+      - HTTPS_PROXY=http://headroom:8787
+      - NO_PROXY=localhost,127.0.0.1,ollama
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:7b}
       - PYTHONPATH=/app
     volumes:
       - ${AGY_BIN_PATH:-~/.local/bin/agy}:/usr/local/bin/agy:ro

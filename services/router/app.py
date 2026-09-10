@@ -15,7 +15,8 @@ app = FastAPI(title="Local AI Context-Router & Compression Stack")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
+AGY_MODEL = os.getenv("AGY_MODEL", "claude-3-7-sonnet").strip()
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
@@ -62,13 +63,14 @@ def package_response(model_name: str, content: str):
 
 def call_ollama_generation(prompt: str) -> str:
     """Fallback or direct code generation using local Ollama model."""
+    print(f"[ROUTER] Invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
     try:
         payload = {
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False
         }
-        resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=120)
+        resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=60)
         if resp.status_code == 200:
             return resp.json().get("response", "")
         return f"Ollama generation returned HTTP {resp.status_code}: {resp.text}"
@@ -159,18 +161,26 @@ def healthz():
 @app.get("/models")
 def list_models():
     """Exposes OpenAI-compatible model registry for Open WebUI discovery."""
+    models_def = [
+        ("auto-router", "Dynamic quota-aware context router"),
+        ("coder", "Antigravity Coder: minimal-diff implementation & tests"),
+        ("reviewer", "Antigravity Reviewer: security & quality auditor"),
+        ("architect", "Antigravity Architect: system design & roadmap planner"),
+    ]
     return {
         "object": "list",
         "data": [
             {
-                "id": "auto-router",
+                "id": mid,
                 "object": "model",
                 "created": 1700000000,
                 "owned_by": "local-compression-stack",
                 "permission": [],
-                "root": "auto-router",
-                "parent": None
+                "root": mid,
+                "parent": None,
+                "name": mid
             }
+            for mid, _ in models_def
         ]
     }
 
@@ -257,33 +267,43 @@ def compress_prompt(prompt: str) -> str:
         print(f"Headroom compression bypassed: {e}")
     return prompt
 
-def execute_agy(prepared_prompt: str) -> Optional[str]:
-    """Execute agy CLI non-interactively with --add-dir /workspace and a 180s timeout."""
+def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optional[str]:
+    """Execute agy CLI non-interactively with active AGY_MODEL, optional persona agent, and workspace cwd."""
     agy_path = shutil.which("agy") or "/usr/local/bin/agy"
     if not os.path.exists(agy_path) and not shutil.which("agy"):
-        print(f"agy executable not found at {agy_path}")
+        print(f"agy executable not found at {agy_path}", flush=True)
         return None
 
-    # Enforce workspace access and skip interactive prompts
+    # Enforce workspace access, model selection, and skip interactive prompts
     cmd = [
         agy_path,
+        "--model", AGY_MODEL,
         "--add-dir", WORKSPACE_DIR,
-        "--dangerously-skip-permissions",
-        "-p", prepared_prompt
+        "--dangerously-skip-permissions"
     ]
+    if agent_id:
+        cmd.extend(["--agent", agent_id])
+    cmd.extend(["-p", prepared_prompt])
+
+    preview = (prepared_prompt[:80] + "...") if len(prepared_prompt) > 80 else prepared_prompt
+    print(
+        f"[ROUTER] Target: AGY | Persona: {agent_id or 'default'} | Model: {AGY_MODEL} | Prompt: {preview}",
+        flush=True
+    )
+
     env = os.environ.copy()
     home_dir = os.getenv("HOME")
     if not home_dir or home_dir == "/root":
         home_dir = "/home/appuser" if os.path.exists("/home/appuser") else os.getenv("WORKSPACE_DIR", "/workspace")
     env["HOME"] = home_dir
-    cwd = os.getenv("WORKSPACE_DIR", "/workspace")
+    cwd = WORKSPACE_DIR if os.path.exists(WORKSPACE_DIR) else "/workspace"
 
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=120,
             env=env,
             cwd=cwd
         )
@@ -292,19 +312,19 @@ def execute_agy(prepared_prompt: str) -> Optional[str]:
         stdout_lower = output.lower()
 
         if proc.returncode != 0:
-            print(f"agy exited with code {proc.returncode}: {proc.stderr}")
+            print(f"agy exited with code {proc.returncode}: {proc.stderr}", flush=True)
             return None
 
         if "quota exceeded" in stdout_lower or "quota exceeded" in stderr_lower or "rate limit" in stdout_lower:
-            print("agy reported quota or rate limit exceeded")
+            print("agy reported quota or rate limit exceeded", flush=True)
             return None
 
         return output if output else "Task completed successfully."
     except subprocess.TimeoutExpired:
-        print("agy execution timed out (180s)")
+        print("agy execution timed out (120s)", flush=True)
         return None
     except Exception as e:
-        print(f"agy subprocess execution error: {e}")
+        print(f"agy subprocess execution error: {e}", flush=True)
         return None
 
 @app.post("/v1/chat/completions")
@@ -315,7 +335,42 @@ def completions(req: ChatCompletionRequest):
 
     prompt_text, parts, has_image = parse_parts(last_msg.content)
 
-    # 1. Multimodal / Vision Bypass
+    # 1. Inspect Model Name or Prompt Prefixes for Persona Switching
+    agent_id = None
+    if req.model in ["coder", "reviewer", "architect"]:
+        agent_id = req.model
+
+    clean_prompt = prompt_text.strip()
+    if clean_prompt.startswith("@reviewer") or clean_prompt.startswith("/reviewer"):
+        agent_id = "reviewer"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+    elif clean_prompt.startswith("@audit") or clean_prompt.startswith("/audit"):
+        agent_id = "reviewer"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+    elif clean_prompt.startswith("@architect") or clean_prompt.startswith("/architect"):
+        agent_id = "architect"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+    elif clean_prompt.startswith("@coder") or clean_prompt.startswith("/coder"):
+        agent_id = "coder"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+    elif clean_prompt.startswith("@dev") or clean_prompt.startswith("/dev"):
+        agent_id = "coder"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+    elif clean_prompt.startswith("@implement") or clean_prompt.startswith("/implement"):
+        agent_id = "coder"
+        clean_prompt = clean_prompt.split(maxsplit=1)[1] if " " in clean_prompt else ""
+
+    if agent_id:
+        agy_output = execute_agy(clean_prompt or prompt_text, agent_id=agent_id)
+        if agy_output is not None:
+            badge = f"*[Agent Task: {agent_id.capitalize()} ({AGY_MODEL})]*\n\n"
+            return package_response(req.model, badge + agy_output)
+
+        # Automatic fallback to local Ollama on failure/timeout
+        fallback_out = call_ollama_generation(clean_prompt or prompt_text)
+        return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
+
+    # 2. Multimodal / Vision Bypass
     if has_image:
         if gemini_client and parts:
             target = "Gemini Vision"
@@ -332,7 +387,7 @@ def completions(req: ChatCompletionRequest):
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + gen_out)
 
-    # 2. Local Prompt Beautification & Target Extraction (Ollama)
+    # 3. Local Prompt Beautification & Target Extraction (Ollama)
     structured_schema = {
         "type": "object",
         "properties": {
@@ -381,10 +436,8 @@ def completions(req: ChatCompletionRequest):
     beautified = meta.get("beautified_prompt") or prompt_text
     target_files = meta.get("target_files", [])
 
-    # 3 & 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
+    # 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
     if is_complex:
-        target = "Antigravity CLI (agy)"
-        print(f"[ROUTER] Target: {target}", flush=True)
         # Pre-read matching files from workspace
         context_str = read_target_files(target_files)
         # Apply anti-hallucination & quota safeguards
@@ -394,7 +447,7 @@ def completions(req: ChatCompletionRequest):
 
         agy_output = execute_agy(compressed_prompt)
         if agy_output is not None:
-            out = "*[Agent Task: Headroom + Antigravity]*\n\n" + agy_output
+            out = f"*[Agent Task: Headroom + Antigravity ({AGY_MODEL})]*\n\n" + agy_output
             return package_response(req.model, out)
 
         # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama
@@ -403,7 +456,7 @@ def completions(req: ChatCompletionRequest):
         fallback_out = call_ollama_generation(beautified)
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
 
-    # Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
+    # 5. Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
     if gemini_client:
         target = "Gemini 2.5 Flash"
         print(f"[ROUTER] Target: {target}", flush=True)
@@ -417,7 +470,7 @@ def completions(req: ChatCompletionRequest):
         except Exception as e:
             print(f"Gemini simple generation error: {e}")
 
-    # Fallback / Default local Ollama (qwen2.5-coder:7b)
+    # Fallback / Default local Ollama
     target = f"Local Ollama ({OLLAMA_MODEL})"
     print(f"[ROUTER] Target: {target}", flush=True)
     ollama_out = call_ollama_generation(beautified)
