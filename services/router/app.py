@@ -272,8 +272,11 @@ def execute_agy(prepared_prompt: str) -> Optional[str]:
         "-p", prepared_prompt
     ]
     env = os.environ.copy()
-    env["HOME"] = "/root"
-    cwd = WORKSPACE_DIR if os.path.exists(WORKSPACE_DIR) else None
+    home_dir = os.getenv("HOME")
+    if not home_dir or home_dir == "/root":
+        home_dir = "/home/appuser" if os.path.exists("/home/appuser") else os.getenv("WORKSPACE_DIR", "/workspace")
+    env["HOME"] = home_dir
+    cwd = os.getenv("WORKSPACE_DIR", "/workspace")
 
     try:
         proc = subprocess.run(
@@ -315,6 +318,8 @@ def completions(req: ChatCompletionRequest):
     # 1. Multimodal / Vision Bypass
     if has_image:
         if gemini_client and parts:
+            target = "Gemini Vision"
+            print(f"[ROUTER] Target: {target}", flush=True)
             try:
                 res = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=parts)
                 out = "*[Vision Routed: Gemini 2.5 Flash]*\n\n" + (res.text or "")
@@ -322,6 +327,8 @@ def completions(req: ChatCompletionRequest):
             except Exception as e:
                 print(f"Gemini vision request failed: {e}")
         # Fallback to local Ollama if no Gemini key or request failed
+        target = f"Local Ollama (Vision Fallback: {OLLAMA_MODEL})"
+        print(f"[ROUTER] Target: {target}", flush=True)
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + gen_out)
 
@@ -360,7 +367,7 @@ def completions(req: ChatCompletionRequest):
                 "format": structured_schema,
                 "stream": False
             },
-            timeout=15
+            timeout=60
         )
         if ollama_res.status_code == 200:
             resp_json = ollama_res.json()
@@ -376,6 +383,8 @@ def completions(req: ChatCompletionRequest):
 
     # 3 & 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
     if is_complex:
+        target = "Antigravity CLI (agy)"
+        print(f"[ROUTER] Target: {target}", flush=True)
         # Pre-read matching files from workspace
         context_str = read_target_files(target_files)
         # Apply anti-hallucination & quota safeguards
@@ -389,11 +398,15 @@ def completions(req: ChatCompletionRequest):
             return package_response(req.model, out)
 
         # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama
+        target = f"Fallback Local Ollama ({OLLAMA_MODEL})"
+        print(f"[ROUTER] Target: {target}", flush=True)
         fallback_out = call_ollama_generation(beautified)
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
 
     # Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
     if gemini_client:
+        target = "Gemini 2.5 Flash"
+        print(f"[ROUTER] Target: {target}", flush=True)
         try:
             res = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -405,5 +418,7 @@ def completions(req: ChatCompletionRequest):
             print(f"Gemini simple generation error: {e}")
 
     # Fallback / Default local Ollama (qwen2.5-coder:7b)
+    target = f"Local Ollama ({OLLAMA_MODEL})"
+    print(f"[ROUTER] Target: {target}", flush=True)
     ollama_out = call_ollama_generation(beautified)
     return package_response(req.model, "*[Simple Task: Local Ollama]*\n\n" + ollama_out)
