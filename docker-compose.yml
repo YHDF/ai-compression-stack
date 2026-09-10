@@ -28,21 +28,18 @@ services:
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:1.5b}
       - HEADROOM_PROXY=http://headroom:8787
-      - AGY_MODEL=${AGY_MODEL:-claude-3-7-sonnet}
+      - AGY_MODEL=${AGY_MODEL:-gpt-oss-120b-medium}
       - ANTHROPIC_BASE_URL=http://headroom:8787
       - OPENAI_BASE_URL=http://headroom:8787/v1
-      - HTTP_PROXY=http://headroom:8787
-      - HTTPS_PROXY=http://headroom:8787
-      - NO_PROXY=localhost,127.0.0.1,ollama
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - PYTHONPATH=/app
     volumes:
-      - ${AGY_BIN_PATH:-~/.local/bin/agy}:/usr/local/bin/agy:ro
-      - ${HOST_LOCAL_PATH:-~/.local}:/home/appuser/.local:ro
-      - ${HOST_CONFIG_PATH:-~/.config}:/home/appuser/.config:ro
-      - ${HOST_GCLOUD_PATH:-~/.config/gcloud}:/home/appuser/.config/gcloud:ro
-      - ${HOST_GEMINI_PATH:-~/.gemini}:/home/appuser/.gemini:rw
-      - ${WORKSPACE_PATH:-~/development}:/workspace:rw
+      - ${AGY_BIN_PATH:-${HOST_HOME}/.local/bin/agy}:/usr/local/bin/agy:ro
+      - ${HOST_LOCAL_PATH:-${HOST_HOME}/.local}:/home/appuser/.local:ro
+      - ${HOST_CONFIG_PATH:-${HOST_HOME}/.config}:/home/appuser/.config:ro
+      - ${HOST_GCLOUD_PATH:-${HOST_HOME}/.config/gcloud}:/home/appuser/.config/gcloud:ro
+      - ${HOST_GEMINI_PATH:-${HOST_HOME}/.gemini}:/home/appuser/.gemini:rw
+      - ${WORKSPACE_PATH:-${HOST_HOME}/development}:/workspace:rw
     working_dir: /app
     depends_on:
       - ollama

@@ -115,8 +115,9 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
 ## Key Features
 
 - **Multi-Agent Persona Dispatching**: Select personas from Open WebUI's model dropdown or trigger them inline via `@coder`, `@reviewer`, or `@architect`.
-- **100% Abstract & Portable**: Uses native `~` volume expansion on the host and standardized `/home/appuser` inside the container. Works seamlessly across Linux, macOS, and Windows WSL with zero hardcoded usernames.
-- **Headroom Compression Proxy**: Routes outgoing provider traffic (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `HTTP_PROXY`) through Headroom to compress prompts and prune repetitive AST bloat.
+- **100% Abstract & Portable**: Uses dynamic `${HOST_HOME}` volume expansion on the host and standardized `/home/appuser` inside the container. Works seamlessly across Linux, macOS, and Windows WSL with zero hardcoded usernames.
+- **Headless MCP Execution**: Bundles a lightweight zero-dependency MCP server (`mcp_workspace.py`) that equips `agy` in headless container mode with full `write_to_file` and non-interactive `run_command` execution capabilities.
+- **Headroom Compression Proxy**: Routes outgoing provider traffic (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`) through Headroom to compress prompts and prune repetitive AST bloat.
 - **Quota & Timeout Protection**: Automatically catches CLI 429 quota limits, rate limits, or cold-start timeouts and fails over to local Ollama in real time without failing user requests.
 - **Live Logging Visibility**: Real-time unbuffered log emission `[ROUTER] Target: ...` in Docker logs for full observability of dispatch decisions.
 

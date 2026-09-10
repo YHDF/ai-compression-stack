@@ -16,7 +16,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
-AGY_MODEL = os.getenv("AGY_MODEL", "claude-3-7-sonnet").strip()
+AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
@@ -34,6 +34,35 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "your_key_here":
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
         print(f"Notice: Gemini client not initialized: {e}")
+
+def ensure_workspace_mcp():
+    """Ensure that the local workspace-tools MCP server is registered for agy."""
+    try:
+        home_dir = os.getenv("HOME", "/home/appuser")
+        config_path = os.path.join(home_dir, ".gemini", "config", "mcp_config.json")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        data = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        servers = data.setdefault("mcpServers", {})
+        mcp_script = "/app/mcp_workspace.py"
+        if "workspace_tools" not in servers and os.path.exists(mcp_script):
+            servers["workspace_tools"] = {
+                "command": "python3",
+                "args": [mcp_script],
+                "disabled": False
+            }
+            with open(config_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print("[ROUTER] Registered workspace_tools MCP server in mcp_config.json", flush=True)
+    except Exception as e:
+        print(f"Notice: could not ensure workspace MCP server: {e}", flush=True)
+
+ensure_workspace_mcp()
 
 class ChatMessage(BaseModel):
     role: str
@@ -274,11 +303,12 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         print(f"agy executable not found at {agy_path}", flush=True)
         return None
 
-    # Enforce workspace access, model selection, and skip interactive prompts
+    # Enforce workspace access, model selection, edit permissions, and skip interactive prompts
     cmd = [
         agy_path,
         "--model", AGY_MODEL,
         "--add-dir", WORKSPACE_DIR,
+        "--mode", "accept-edits",
         "--dangerously-skip-permissions"
     ]
     if agent_id:
@@ -292,11 +322,28 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
     )
 
     env = os.environ.copy()
+    # Strip general proxy variables so agy connects directly to Google Cloud endpoints
+    for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
+        env.pop(proxy_var, None)
     home_dir = os.getenv("HOME")
     if not home_dir or home_dir == "/root":
         home_dir = "/home/appuser" if os.path.exists("/home/appuser") else os.getenv("WORKSPACE_DIR", "/workspace")
     env["HOME"] = home_dir
     cwd = WORKSPACE_DIR if os.path.exists(WORKSPACE_DIR) else "/workspace"
+
+    # Ensure workspace is registered in trustedWorkspaces
+    try:
+        cli_settings = os.path.join(home_dir, ".gemini", "antigravity-cli", "settings.json")
+        if os.path.exists(cli_settings):
+            with open(cli_settings, "r") as f:
+                cfg = json.load(f)
+            tw = cfg.setdefault("trustedWorkspaces", [])
+            if cwd not in tw:
+                tw.append(cwd)
+                with open(cli_settings, "w") as f:
+                    json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Notice: could not verify trustedWorkspaces: {e}", flush=True)
 
     try:
         proc = subprocess.run(
