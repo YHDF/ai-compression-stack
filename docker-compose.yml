@@ -27,7 +27,7 @@ services:
       - WORKSPACE_DIR=/workspace
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:1.5b}
-      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-35}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-300}
       - HEADROOM_PROXY=http://headroom:8787
       - AGY_MODEL=${AGY_MODEL:-gpt-oss-120b-medium}
       - AGY_TIMEOUT=${AGY_TIMEOUT:-180}

@@ -16,7 +16,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b").strip()
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "35"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
 AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
 AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "180"))
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
@@ -101,7 +101,7 @@ def call_ollama_generation(prompt: str) -> str:
             "prompt": prompt,
             "stream": False
         }
-        resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=60)
+        resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
         if resp.status_code == 200:
             return resp.json().get("response", "")
         return f"Ollama generation returned HTTP {resp.status_code}: {resp.text}"
@@ -518,7 +518,7 @@ def completions(req: ChatCompletionRequest):
     if "headroom" in req.model.lower():
         try:
             headroom_req = req.model_dump()
-            headroom_res = requests.post(f"{HEADROOM_PROXY}/v1/chat/completions", json=headroom_req, timeout=60)
+            headroom_res = requests.post(f"{HEADROOM_PROXY}/v1/chat/completions", json=headroom_req, timeout=AGY_TIMEOUT)
             if headroom_res.status_code == 200:
                 return headroom_res.json()
             return JSONResponse(status_code=headroom_res.status_code, content=headroom_res.json())
@@ -595,7 +595,7 @@ def completions(req: ChatCompletionRequest):
                 "format": structured_schema,
                 "stream": False
             },
-            timeout=60
+            timeout=OLLAMA_TIMEOUT
         )
         if ollama_res.status_code == 200:
             resp_json = ollama_res.json()

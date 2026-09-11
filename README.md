@@ -184,7 +184,7 @@ Customize these variables in your `.env` file:
 | `AGY_MODEL` | `gpt-oss-120b-medium` | Model target used by Antigravity CLI (`agy --model`). |
 | `AGY_TIMEOUT` | `180` | Subprocess execution and print timeout in seconds for `agy`. |
 | `OLLAMA_MODEL` | `qwen2.5-coder:0.5b` | Model used for local file discovery, MCP assistance, and offline fallback. |
-| `OLLAMA_TIMEOUT` | `35` | Timeout in seconds for local Ollama dependency discovery and analysis. |
+| `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for local Ollama dependency discovery, generation fallback, and analysis. |
 | `PORT_ROUTER` | `8088` | Host port exposed for the Quota Router Gateway. |
 | `HOST_UID` | `1000` | Host user ID mapped into the container. |
 | `HOST_GID` | `1000` | Host group ID mapped into the container. |

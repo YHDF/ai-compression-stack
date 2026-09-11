@@ -129,7 +129,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
     ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b")
-    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "45"))
+    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "300"))
 
     system_prompt = (
         "You are an embedded repository intelligence engine assisting a principal software engineer. "
