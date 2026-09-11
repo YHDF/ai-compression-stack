@@ -7,6 +7,7 @@ exposing workspace file-write and execution tools to Antigravity (agy).
 import sys
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -85,6 +86,33 @@ def handle_run_command(args: dict) -> dict:
     cwd = args.get("cwd") or WORKSPACE_ROOT
     if not cmd_str:
         return {"content": [{"type": "text", "text": "Error: missing required 'command' parameter"}], "isError": True}
+
+    # Strict token preservation: block all test runner commands (including single test methods)
+    lowered_cmd = cmd_str.strip().lower()
+    test_block_patterns = [
+        r"\bmvn\b.*?\b(test|verify|-dtest)\b",
+        r"\bgradlew?\b.*?\b(test|check|--tests)\b",
+        r"\bpytest\b",
+        r"\bpython\b.*?\b-m\s+(unittest|pytest)\b",
+        r"\b(npm|yarn|pnpm|bun)\b.*?\b(test|run\s+test)\b",
+        r"\bgo\b\s+test\b",
+        r"\bcargo\b\s+test\b",
+        r"\bdotnet\b\s+test\b",
+    ]
+    for pattern in test_block_patterns:
+        if re.search(pattern, lowered_cmd):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Execution Blocked: Executing tests ('{cmd_str}') is strictly prohibited to preserve "
+                        "token quota and avoid flooding the context window with build/test logs. "
+                        "Do not run test suites or individual test methods. "
+                        "Perform code changes and static analysis, then instruct the user under 'Next Steps' to run the test locally."
+                    )
+                }],
+                "isError": True
+            }
     
     # Environment with non-interactive defaults
     env = os.environ.copy()
@@ -121,19 +149,99 @@ def handle_run_command(args: dict) -> dict:
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Execution error: {e}"}], "isError": True}
 
+def retrieve_local_workspace_context(query: str, max_chars: int = 12000) -> str:
+    """Fast zero-cost local code retrieval from /workspace for keywords mentioned in query."""
+    root = Path(WORKSPACE_ROOT)
+    if not root.exists():
+        return ""
+
+    # Extract potential symbol names (CamelCase, snake_case, alphanumeric terms > 3 chars)
+    words = re.findall(r'[A-Za-z0-9_]{4,}', query)
+    stop_words = {
+        "what", "where", "when", "which", "with", "from", "that", "this", "have", "test",
+        "case", "code", "file", "mock", "should", "using", "class", "method", "into",
+        "true", "false", "please", "write", "create", "implement", "verify", "check"
+    }
+    candidates = [w for w in words if w.lower() not in stop_words]
+    if not candidates:
+        return ""
+
+    SKIP_DIRS = {".git", "node_modules", "target", "build", ".gradle", "venv", "env", "__pycache__", ".idea", ".vscode", "dist"}
+    snippets = []
+    total_len = 0
+
+    # Scan workspace files for matched lines
+    for p in root.rglob("*"):
+        if p.is_dir() or any(part in SKIP_DIRS or part.startswith(".") for part in p.parts):
+            continue
+        ext = p.suffix.lower()
+        if ext not in (".java", ".py", ".ts", ".js", ".json", ".yml", ".yaml", ".xml"):
+            continue
+
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        rel_p = str(p.relative_to(root)).replace("\\", "/")
+        lines = content.splitlines()
+
+        matched_line_indices = set()
+        for idx, line in enumerate(lines):
+            for cand in candidates:
+                if cand in line:
+                    for offset in range(max(0, idx - 2), min(len(lines), idx + 5)):
+                        matched_line_indices.add(offset)
+
+        if matched_line_indices:
+            sorted_indices = sorted(matched_line_indices)
+            groups = []
+            current_group = []
+            for line_idx in sorted_indices:
+                if not current_group or line_idx == current_group[-1] + 1:
+                    current_group.append(line_idx)
+                else:
+                    groups.append(current_group)
+                    current_group = [line_idx]
+            if current_group:
+                groups.append(current_group)
+
+            file_snippets = []
+            for g in groups[:3]:
+                block = "\n".join(f"{li+1}: {lines[li]}" for li in g)
+                file_snippets.append(block)
+
+            joined_blocks = "\n...\n".join(file_snippets)
+            snippet_str = f"--- File: {rel_p} ---\n{joined_blocks}\n"
+            if total_len + len(snippet_str) > max_chars:
+                break
+            snippets.append(snippet_str)
+            total_len += len(snippet_str)
+
+    if snippets:
+        return "## Retrieved Workspace Code Snippets:\n" + "\n".join(snippets)
+    return ""
+
 def handle_ask_local_assistant(args: dict) -> dict:
     query = args.get("query") or args.get("prompt") or args.get("question") or ""
     context = args.get("context") or args.get("code") or ""
     if not query:
         return {"content": [{"type": "text", "text": "Error: missing required 'query' parameter"}], "isError": True}
 
+    # Automatically retrieve local workspace snippets if no explicit context was passed
+    if not context:
+        auto_snippets = retrieve_local_workspace_context(query)
+        if auto_snippets:
+            context = auto_snippets
+
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "300"))
 
     system_prompt = (
         "You are an embedded repository intelligence engine assisting a principal software engineer. "
-        "Provide direct, high-density technical analysis, interface contracts, symbol traces, or implementation facts. "
+        "Provide direct, high-density technical analysis, interface contracts, symbol traces, mock patterns, or implementation code. "
+        "Base your answer strictly on the provided workspace context when available. "
         "Omit conversational preambles, greetings, apologies, and stylistic commentary. "
         "Ensure any returned code snippets are minimal and unembellished, with docstrings and comments omitted."
     )
@@ -162,7 +270,6 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
             # Post-process answer: strip comments/docstrings from code blocks if present
             try:
-                import re
                 from ast_compressor import compress_python_code
                 def repl(m):
                     lang = m.group(1)
@@ -174,7 +281,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
             except Exception:
                 pass
 
-            return {"content": [{"type": "text", "text": f"[Local Ollama (0 Cloud Tokens)]:\n{answer}"}]}
+            return {"content": [{"type": "text", "text": f"[Local Ollama ({ollama_model} | 0 Cloud Tokens)]:\n{answer}"}]}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Local assistant query failed: {e}"}], "isError": True}
 
@@ -183,54 +290,90 @@ def handle_trace_symbol(args: dict) -> dict:
     if not symbol:
         return {"content": [{"type": "text", "text": "Error: missing required 'symbol' parameter"}], "isError": True}
 
-    import ast
     root = Path(WORKSPACE_ROOT)
     definitions = []
     usages = []
 
-    # Scan python files in workspace (skip venv, git, cache)
-    for p in root.rglob("*.py"):
-        if any(part.startswith(".") or part in ("venv", "env", "__pycache__", "node_modules") for part in p.parts):
+    SKIP_DIRS = {".git", "node_modules", "target", "build", ".gradle", "venv", "env", "__pycache__", ".idea", ".vscode", "dist"}
+
+    # Multi-language scan: Java, Python, TypeScript, JavaScript
+    for p in root.rglob("*"):
+        if p.is_dir() or any(part in SKIP_DIRS or part.startswith(".") for part in p.parts):
             continue
+        ext = p.suffix.lower()
+        if ext not in (".java", ".py", ".ts", ".js", ".tsx", ".jsx"):
+            continue
+
         try:
-            rel_p = str(p.relative_to(root))
+            rel_p = str(p.relative_to(root)).replace("\\", "/")
             content = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
 
         lines = content.splitlines()
-        # Find usage lines
+
+        # Usages scan
         for idx, line in enumerate(lines, 1):
             if symbol in line:
                 s_line = line.strip()
-                if not (s_line.startswith("def ") or s_line.startswith("class ")):
-                    usages.append(f"{rel_p}:{idx}: {s_line[:80]}")
+                if not any(s_line.startswith(decl) for decl in ("class ", "interface ", "enum ", "record ", "def ", "public class ", "public interface ", "public record ")):
+                    usages.append(f"{rel_p}:{idx}: {s_line[:90]}")
 
-        # AST parse for definitions
-        try:
-            tree = ast.parse(content, filename=str(p))
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
-                    args_list = [a.arg for a in node.args.args]
-                    definitions.append(f"Function in {rel_p}:{node.lineno} -> def {symbol}({', '.join(args_list)})")
-                elif isinstance(node, ast.ClassDef) and node.name == symbol:
-                    bases = [getattr(b, "id", "...") for b in node.bases]
-                    definitions.append(f"Class in {rel_p}:{node.lineno} -> class {symbol}({', '.join(bases)})")
-        except Exception:
-            pass
+        # Declarations scan
+        if ext == ".py":
+            import ast
+            try:
+                tree = ast.parse(content, filename=str(p))
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
+                        args_list = [a.arg for a in node.args.args]
+                        definitions.append(f"Python def {symbol}({', '.join(args_list)}) -> {rel_p}:{node.lineno}")
+                    elif isinstance(node, ast.ClassDef) and node.name == symbol:
+                        bases = [getattr(b, "id", "...") for b in node.bases]
+                        definitions.append(f"Python class {symbol}({', '.join(bases)}) -> {rel_p}:{node.lineno}")
+            except Exception:
+                pass
+        elif ext == ".java":
+            class_regex = re.compile(r'^\s*(?:@[\w()]+\s+)*(?:public|protected|private)?\s*(?:abstract|static|final|\s)*\b(class|interface|record|enum)\s+(' + re.escape(symbol) + r')\b')
+            method_regex = re.compile(r'^\s*(?:@[\w()]+\s+)*(?:public|protected|private)?\s*(?:static|final|synchronized|\s)*([\w<>\[\],\s]+)\s+(' + re.escape(symbol) + r')\s*\(([^)]*)\)')
+            field_regex = re.compile(r'^\s*(?:@(?:Autowired|Mock|Spy|MockitoSpyBean|MockBean|Inject|Value|Resource)[\w()"\',=\s]*\s+)?(?:public|protected|private)?\s*([\w<>\[\],\s]+)\s+(' + re.escape(symbol) + r')\s*[;=]')
 
-    out_lines = [f"=== Symbol Trace: '{symbol}' ==="]
+            for idx, line in enumerate(lines, 1):
+                m_class = class_regex.search(line)
+                if m_class:
+                    prev_anno = lines[idx-2].strip() if idx > 1 and lines[idx-2].strip().startswith("@") else ""
+                    anno_str = f"[{prev_anno}] " if prev_anno else ""
+                    definitions.append(f"Java {anno_str}{m_class.group(1)} {symbol} -> {rel_p}:{idx}")
+                    continue
+                m_method = method_regex.search(line)
+                if m_method:
+                    ret_type = m_method.group(1).strip()
+                    params = m_method.group(3).strip()
+                    definitions.append(f"Java method: {ret_type} {symbol}({params}) -> {rel_p}:{idx}")
+                    continue
+                m_field = field_regex.search(line)
+                if m_field and ("@" in line or "Repository" in line or "Service" in line or "Client" in line):
+                    field_type = m_field.group(1).strip()
+                    definitions.append(f"Java field: {field_type} {symbol} -> {rel_p}:{idx}")
+        elif ext in (".ts", ".js", ".tsx", ".jsx"):
+            ts_regex = re.compile(r'^\s*(?:export\s+)?(?:default\s+)?(class|interface|type|function|const|let)\s+(' + re.escape(symbol) + r')\b')
+            for idx, line in enumerate(lines, 1):
+                m_ts = ts_regex.search(line)
+                if m_ts:
+                    definitions.append(f"{ext[1:].upper()} {m_ts.group(1)} {symbol} -> {rel_p}:{idx}")
+
+    out_lines = [f"=== Symbol Trace: '{symbol}' (Languages: Java, Python, TypeScript) ==="]
     if definitions:
-        out_lines.append("## Definitions:")
-        out_lines.extend(f"- {d}" for d in definitions)
+        out_lines.append("## Definitions & Signatures:")
+        out_lines.extend(f"- {d}" for d in definitions[:15])
     else:
-        out_lines.append("## Definitions: (No explicit def/class found in workspace)")
+        out_lines.append("## Definitions: (No explicit class/method declaration found in workspace)")
 
     if usages:
-        out_lines.append(f"## Usages ({len(usages)} total, showing up to 10):")
+        out_lines.append(f"## Usages ({len(usages)} total, showing top 10):")
         out_lines.extend(f"- {u}" for u in usages[:10])
     else:
-        out_lines.append("## Usages: (No calls/references found)")
+        out_lines.append("## Usages: (No call sites found)")
 
     return {"content": [{"type": "text", "text": "\n".join(out_lines)}]}
 
@@ -287,17 +430,17 @@ TOOLS = [
     },
     {
         "name": "ask_local_assistant",
-        "description": "Query local zero-cost Ollama assistant for architecture, call references, or logic summaries without consuming cloud tokens.",
+        "description": "Query local zero-cost Ollama assistant (qwen2.5-coder:1.5b) grounded with workspace code retrieval for signatures, mock patterns, and code drafting without consuming cloud tokens.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The exact question or search request to ask local Ollama"
+                    "description": "The question, mock pattern request, or code drafting prompt to ask local Ollama"
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional code snippet or context to evaluate"
+                    "description": "Optional code snippet or context to evaluate (auto-retrieves from workspace if empty)"
                 }
             },
             "required": ["query"]
@@ -305,13 +448,13 @@ TOOLS = [
     },
     {
         "name": "trace_symbol",
-        "description": "Trace Python symbol definitions (functions, classes) and callers across workspace files using fast AST parsing.",
+        "description": "Trace symbol definitions (classes, interfaces, methods, Spring beans) and call sites across Java, Python, and TypeScript workspace files.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "The function or class name to trace across the workspace"
+                    "description": "The class, interface, method, or bean name to trace across the workspace"
                 }
             },
             "required": ["symbol"]

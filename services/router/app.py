@@ -15,7 +15,7 @@ app = FastAPI(title="Local AI Context-Router & Compression Stack")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
 AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
 AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "180"))
@@ -392,10 +392,12 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     guardrails = (
         "## Operational Boundaries & Guardrails:\n"
         "- Scope: Modify strictly the files required to fulfill the specification.\n"
-        "- Fast Convergence: Consolidate actions. Execute batch operations (e.g. batch deletions or multi-file edits) in a single turn. Complete execution in 2 turns maximum.\n"
-        "- Token Economy: Leverage pre-read context; avoid redundant disk scans or serial tool iterations.\n"
-        "- Local Drafting (0 Cloud Tokens): For complex algorithms, mocks, boilerplate, or symbol traces, query the MCP tool 'ask_local_assistant' to draft code using local Ollama without burning cloud tokens, then apply edits directly to the files in /workspace.\n"
-        "- Output: Maintain minimal, clean diffs with high-fidelity verification.\n\n"
+        "- Fast Convergence: You MUST complete all file modifications in at most 2 turns. Do NOT perform exploratory searches or repeat failed tool calls.\n"
+        "- Zero Search Loops: Never call cloud-billed grep_search or dump unneeded files with view_file. Target files and pre-read context are already provided.\n"
+        "- Mandatory Local Inquiries (0 Cloud Tokens): To discover class/method signatures, bean types, or mock patterns, you MUST call 'trace_symbol' (supports Java, Python, TS) or 'ask_local_assistant' (grounded with local workspace retrieval). Zero cloud tokens are consumed.\n"
+        "- Mandatory Local Code Drafting: For new test cases, mock fixtures, and boilerplate, ALWAYS invoke 'ask_local_assistant' to draft the implementation using local Ollama (qwen2.5-coder:1.5b) before applying edits to /workspace.\n"
+        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running any test suites, test runners, or individual test methods (e.g., 'mvn test', 'mvn -Dtest=...', 'gradle test', 'pytest', 'npm test'). Report the diff cleanly and instruct the user to execute tests locally under Next Steps.\n"
+        "- Formatting Lock: Strictly maintain existing code style, tab indentation, and minimal diffs.\n\n"
     )
     parts = [guardrails]
     if context_str:
@@ -414,7 +416,6 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
     cmd = [
         agy_path,
         "--model", AGY_MODEL,
-        "--add-dir", WORKSPACE_DIR,
         "--mode", "accept-edits",
         "--dangerously-skip-permissions",
         "--print-timeout", f"{AGY_TIMEOUT}s"
