@@ -28,11 +28,11 @@ User Prompt (Open WebUI / API)
            │
            ▼
 [ Antigravity (agy) Execution with Headless MCP ]
-    - Subprocess agy --model <AGY_MODEL> --add-dir /workspace --dangerously-skip-permissions
+    - Subprocess agy --model <AGY_MODEL> --mode accept-edits --dangerously-skip-permissions
     - Receives compressed code upfront (no blind disk searches needed)
     - Equipped with zero-cost in-flight MCP tools:
-        • trace_symbol: AST-based function/class and call-site tracing
-        • ask_local_assistant: In-flight questions to local Ollama (0 cloud tokens)
+        • trace_symbol: Multi-language (Java, Python, TypeScript) symbol, Spring bean, and call-site tracer
+        • ask_local_assistant: Workspace-grounded code retrieval and drafting via local Ollama (0 cloud tokens)
            │
            ▼
 [ Execution or Local Fallback ]
@@ -85,7 +85,7 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 | :--- | :--- | :--- | :--- | :--- |
 | **`router`** | `quota-router` | `8088` | `8000` | FastAPI gateway providing OpenAI-compatible `/v1/chat/completions`, AST code compressor, auto-discovery, telemetry (`/stats`), and model registry. |
 | **`headroom`** | `headroom-proxy` | `8787` | `8787` | Context compression and prefix-caching reverse proxy for direct LLM completions. |
-| **`ollama`** | `local-ollama` | `11434` | `11434` | Local model inference engine (`qwen2.5-coder:0.5b`) for zero-cost file discovery, in-flight MCP assistance, and offline fallback. |
+| **`ollama`** | `local-ollama` | `11434` | `11434` | Local model inference engine (`qwen2.5-coder:1.5b`) for zero-cost file discovery, in-flight MCP assistance, and offline fallback. |
 | **`open-webui`** | `open-webui` | `3000` | `8080` | Full-featured chat interface wired to both `http://router:8000/v1` and `http://headroom:8787/v1`. |
 
 ---
@@ -126,9 +126,9 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
   - **Markdown (`.md`, `.mdx`, `.txt`)**: Comment removal and excessive blank line compaction.
 - **In-Flight Zero-Cost MCP Tools (`mcp_workspace.py`)**:
   - `write_to_file`: Headless file creations and non-destructive edits.
-  - `run_command`: Sandboxed command runner (`/bin/bash`, `stdin=DEVNULL`, 64KB capped output, 120s timeout).
-  - `trace_symbol`: Fast AST-based Python symbol and call-site tracer.
-  - `ask_local_assistant`: Query local Ollama mid-execution for logic analysis and boilerplate generation without burning cloud quota.
+  - `run_command`: Sandboxed command runner with hard programmatic interceptors blocking test executions (`mvn test`, `pytest`, etc.) to prevent context window saturation.
+  - `trace_symbol`: Fast multi-language symbol tracer supporting Java (classes, interfaces, Spring beans, methods), Python (AST), and TypeScript.
+  - `ask_local_assistant`: Query local Ollama (`qwen2.5-coder:1.5b`) grounded with automated workspace snippet retrieval for signatures, mock patterns, and code/boilerplate drafting (0 cloud tokens).
   - `delete_file`: Safe single or batch deletion of obsolete files/directories within `/workspace`.
 - **Fast Convergence**: Enforces multi-file batching so agent actions complete within 2 turns rather than serial multi-minute round trips.
 - **Real-Time Telemetry (`/stats`)**: Query `http://localhost:8088/stats` for live cumulative statistics on AST tokens saved, requests processed, and Headroom proxy cache metrics.
@@ -143,7 +143,7 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
 - [Docker](https://docs.docker.com/get-docker/) & Docker Compose v2+
 - Linux, macOS, or Windows WSL2
 - [Antigravity CLI](https://github.com/google/antigravity) (`agy`) installed and logged in on the host (defaults to `~/.local/bin/agy`)
-- Ollama model (defaults to `qwen2.5-coder:0.5b`)
+- Ollama model (defaults to `qwen2.5-coder:1.5b`)
 
 ### Quickstart
 
@@ -181,9 +181,9 @@ Customize these variables in your `.env` file:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `AGY_MODEL` | `gpt-oss-120b-medium` | Model target used by Antigravity CLI (`agy --model`). |
+| `AGY_MODEL` | `gemini-3.8-flash-medium` | Model target used by Antigravity CLI (`agy --model`). |
 | `AGY_TIMEOUT` | `180` | Subprocess execution and print timeout in seconds for `agy`. |
-| `OLLAMA_MODEL` | `qwen2.5-coder:0.5b` | Model used for local file discovery, MCP assistance, and offline fallback. |
+| `OLLAMA_MODEL` | `qwen2.5-coder:1.5b` | Model used for local file discovery, MCP assistance, and offline fallback. |
 | `OLLAMA_TIMEOUT` | `300` | Timeout in seconds for local Ollama dependency discovery, generation fallback, and analysis. |
 | `PORT_ROUTER` | `8088` | Host port exposed for the Quota Router Gateway. |
 | `HOST_UID` | `1000` | Host user ID mapped into the container. |
@@ -243,7 +243,7 @@ Specification:
 
 Constraints:
 - Produce minimal targeted diffs; preserve untouched code and formatting.
-- Verify syntax and run tests if present.
+- Verify syntax statically. Do not execute test builds (provide the test command under Next Steps).
 ````
 
 #### Example (Sample Task)
@@ -261,7 +261,7 @@ Specification:
 
 Constraints:
 - Do not modify existing cryptographic signature checks.
-- Run `pytest tests/test_token_manager.py` to confirm tests pass.
+- Verify logic statically; report the pytest command under Next Steps for local execution.
 ````
 
 ---
