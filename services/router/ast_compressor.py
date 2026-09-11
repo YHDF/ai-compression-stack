@@ -131,7 +131,7 @@ def compress_c_family_code(code: str) -> str:
         return ""
     try:
         stripped = re.sub(pattern, replacer, code)
-        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        lines = [line.rstrip() for line in stripped.splitlines() if line.strip()]
         return "\n".join(lines)
     except Exception:
         return strip_generic_whitespace(code)

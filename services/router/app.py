@@ -301,13 +301,18 @@ def discover_relevant_files(prompt: str) -> List[str]:
         return []
 
     # 1. Check if user explicitly mentioned file paths in prompt
-    words = prompt.replace("`", " ").replace('"', ' ').replace("'", " ").replace(",", " ").split()
-    explicit = [w for w in words if "." in w and not w.startswith("@") and not w.startswith("/") and not w.endswith(".")]
+    raw_tokens = prompt.replace("`", " ").replace('"', ' ').replace("'", " ").replace(",", " ").split()
     valid_explicit = []
-    for f in explicit:
-        full_p = os.path.join(WORKSPACE_DIR, f)
-        if os.path.isfile(full_p):
-            valid_explicit.append(f)
+    for raw in raw_tokens:
+        clean = raw.strip("[](){}<>,:;'\"`*").strip()
+        if not clean or "." not in clean or clean.startswith("@") or clean.endswith("."):
+            continue
+        if os.path.isabs(clean) and clean.startswith(WORKSPACE_DIR):
+            clean = os.path.relpath(clean, WORKSPACE_DIR).replace("\\", "/")
+        full_p = os.path.join(WORKSPACE_DIR, clean)
+        if os.path.isfile(full_p) and clean not in valid_explicit:
+            valid_explicit.append(clean)
+
     if valid_explicit:
         print(f"[ROUTER] Explicit target file(s) matched: {valid_explicit}", flush=True)
         return valid_explicit
