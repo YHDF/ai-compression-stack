@@ -20,3 +20,22 @@
 - **Pre-Read Context**: When `Workspace Pre-Read Context` is present, treat it as the compressed source of truth; avoid redundant `view_file` calls on the same files.
 - **Local Helper Tools**: Prefer `trace_symbol` and `ask_local_assistant` MCP tools for call-graph tracing and codebase inquiries to preserve token budget.
 
+## Code Style & Formatting Preservation Rules
+
+1. **Indentation Detection & Lock**:
+   - Detect and strictly match the existing indentation character of the target file before writing edits.
+   - If a file uses Hard Tabs (`\t`), keep all new or modified line indentations as Hard Tabs. Do not expand tabs to spaces.
+   - If a file uses spaces, match the exact indent size (e.g., 2 spaces or 4 spaces).
+
+2. **Line Ending Integrity**:
+   - Detect whether the target file uses Unix LF (`\n`) or Windows CRLF (`\r\n`) and preserve it strictly across all edited lines.
+   - Default to Unix LF (`\n`) for new files created inside the Linux container.
+
+3. **Character Encoding & Whitespace Safety**:
+   - Only output standard ASCII spaces (`0x20`) and standard tabs (`0x09`).
+   - Never insert UTF-8 Non-Breaking Spaces (`\u00A0` / `0xC2 0xA0`) or invisible unicode formatting characters.
+
+4. **Diff Minimization**:
+   - Lock formatting on unmodified lines outside the immediate diff range.
+   - Never run global auto-formatters, re-indent entire classes, or modify untouched imports.
+
