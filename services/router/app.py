@@ -17,8 +17,8 @@ HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
-AGY_MODEL = os.getenv("AGY_MODEL", "gpt-oss-120b-medium").strip()
-AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "180"))
+AGY_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-medium").strip()
+AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "300"))
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit

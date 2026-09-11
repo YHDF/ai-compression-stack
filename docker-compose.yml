@@ -30,7 +30,7 @@ services:
       - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-300}
       - HEADROOM_PROXY=http://headroom:8787
       - AGY_MODEL=${AGY_MODEL:-gemini-3.8-flash-medium}
-      - AGY_TIMEOUT=${AGY_TIMEOUT:-180}
+      - AGY_TIMEOUT=${AGY_TIMEOUT:-300}
       - ANTHROPIC_BASE_URL=http://headroom:8787
       - OPENAI_BASE_URL=http://headroom:8787/v1
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}

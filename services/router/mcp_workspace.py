@@ -149,7 +149,7 @@ def handle_run_command(args: dict) -> dict:
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Execution error: {e}"}], "isError": True}
 
-def retrieve_local_workspace_context(query: str, max_chars: int = 12000) -> str:
+def retrieve_local_workspace_context(query: str, max_chars: int = 4000) -> str:
     """Fast zero-cost local code retrieval from /workspace for keywords mentioned in query."""
     root = Path(WORKSPACE_ROOT)
     if not root.exists():
@@ -190,7 +190,7 @@ def retrieve_local_workspace_context(query: str, max_chars: int = 12000) -> str:
         for idx, line in enumerate(lines):
             for cand in candidates:
                 if cand in line:
-                    for offset in range(max(0, idx - 2), min(len(lines), idx + 5)):
+                    for offset in range(max(0, idx - 2), min(len(lines), idx + 4)):
                         matched_line_indices.add(offset)
 
         if matched_line_indices:
@@ -254,7 +254,11 @@ def handle_ask_local_assistant(args: dict) -> dict:
     req_body = json.dumps({
         "model": ollama_model,
         "prompt": full_prompt,
-        "stream": False
+        "stream": False,
+        "options": {
+            "num_predict": 300,
+            "temperature": 0.2
+        }
     }).encode("utf-8")
 
     req = urllib.request.Request(
