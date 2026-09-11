@@ -394,6 +394,7 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
         "- Scope: Modify strictly the files required to fulfill the specification.\n"
         "- Fast Convergence: Consolidate actions. Execute batch operations (e.g. batch deletions or multi-file edits) in a single turn. Complete execution in 2 turns maximum.\n"
         "- Token Economy: Leverage pre-read context; avoid redundant disk scans or serial tool iterations.\n"
+        "- Local Drafting (0 Cloud Tokens): For complex algorithms, mocks, boilerplate, or symbol traces, query the MCP tool 'ask_local_assistant' to draft code using local Ollama without burning cloud tokens, then apply edits directly to the files in /workspace.\n"
         "- Output: Maintain minimal, clean diffs with high-fidelity verification.\n\n"
     )
     parts = [guardrails]
@@ -405,8 +406,8 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
 def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optional[str]:
     """Execute agy CLI non-interactively with active AGY_MODEL, optional persona agent, and workspace cwd."""
     agy_path = shutil.which("agy") or "/usr/local/bin/agy"
-    if not os.path.exists(agy_path) and not shutil.which("agy"):
-        print(f"agy executable not found at {agy_path}", flush=True)
+    if not os.path.exists(agy_path) or os.path.isdir(agy_path) or not os.access(agy_path, os.X_OK):
+        print(f"agy executable not found or not executable at {agy_path}", flush=True)
         return None
 
     # Enforce workspace access, model selection, edit permissions, and skip interactive prompts
@@ -455,9 +456,10 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
     try:
         proc = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=AGY_TIMEOUT,
+            timeout=AGY_TIMEOUT + 15,
             env=env,
             cwd=cwd
         )
@@ -466,7 +468,8 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         stdout_lower = output.lower()
 
         if proc.returncode != 0:
-            print(f"agy exited with code {proc.returncode}: {proc.stderr}", flush=True)
+            err_msg = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+            print(f"agy exited with code {proc.returncode}: {err_msg}", flush=True)
             return None
 
         if "quota exceeded" in stdout_lower or "quota exceeded" in stderr_lower or "rate limit" in stdout_lower:
@@ -530,7 +533,7 @@ def completions(req: ChatCompletionRequest):
         target_files = discover_relevant_files(clean_prompt or prompt_text)
         ws_context = read_target_files(target_files) if target_files else ""
 
-        prepared = (ws_context + "\n\n" + clean_prompt) if ws_context else (clean_prompt or prompt_text)
+        prepared = apply_guardrails(clean_prompt or prompt_text, ws_context)
         agy_output = execute_agy(prepared, agent_id=agent_id)
         if agy_output is not None:
             from ast_compressor import get_stats
