@@ -51,7 +51,9 @@ def ensure_workspace_mcp():
             except Exception:
                 data = {}
         servers = data.setdefault("mcpServers", {})
-        mcp_script = "/app/mcp_workspace.py"
+        mcp_script = "/app/src/mcp_workspace.py"
+        if not os.path.exists(mcp_script):
+            mcp_script = "/app/mcp_workspace.py"
         if "workspace_tools" not in servers and os.path.exists(mcp_script):
             servers["workspace_tools"] = {
                 "command": "python3",
@@ -341,6 +343,7 @@ def discover_relevant_files(prompt: str) -> List[str]:
         return workspace_files
 
     # 3. For multi-file projects, score candidates using prompt keywords to avoid context overflow
+    words = re.findall(r'[A-Za-z0-9_]{3,}', prompt)
     prompt_tokens = set(w.lower().replace("-", "").replace("_", "") for w in words if len(w) > 2)
     scored = []
     for f in workspace_files:
@@ -375,7 +378,6 @@ def discover_relevant_files(prompt: str) -> List[str]:
         )
         if res.status_code == 200:
             ans = res.json().get("response", "").strip()
-            import re
             m = re.search(r"\[.*?\]", ans, re.DOTALL)
             if m:
                 chosen = json.loads(m.group(0))

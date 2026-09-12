@@ -123,7 +123,7 @@ def strip_generic_whitespace(text: str) -> str:
     return "\n".join(lines)
 
 def compress_c_family_code(code: str) -> str:
-    """Strip comments and redundant whitespace from C-style languages (JS, TS, C, C++, Java, Go, Rust, C#, PHP)."""
+    """Strip comments, collapse newlines, brackets, and separators from C-style languages (JS, TS, C, C++, Java, Go, Rust, C#, PHP)."""
     pattern = r'(\'\'\'|"""|\'([^\'\\]*(\\.[^\'\\]*)*)\'|"([^"\\]*(\\.[^"\\]*)*)"|`([^`\\]*(\\.[^`\\]*)*)`)|(/\*[\s\S]*?\*/|//[^\r\n]*)'
     def replacer(match):
         if match.group(1):
@@ -131,10 +131,56 @@ def compress_c_family_code(code: str) -> str:
         return ""
     try:
         stripped = re.sub(pattern, replacer, code)
-        lines = [line.rstrip() for line in stripped.splitlines() if line.strip()]
-        return "\n".join(lines)
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        result = "\n".join(lines)
+        # Collapse newlines around braces, semicolons, and commas
+        result = re.sub(r'\s*([\{\}\;,])\s*\n\s*', r'\1 ', result)
+        result = re.sub(r'\n{2,}', '\n', result)
+        return result.strip()
     except Exception:
         return strip_generic_whitespace(code)
+
+def compress_log_file(content: str, max_lines: int = 100) -> str:
+    """
+    Compress application logs (Spring Boot, Node.js, Python) by extracting:
+    - Error / Fatal / Exception log lines
+    - 'Caused by:' exception root causes
+    - User application stack frames (omitting repetitive internal framework frames)
+    """
+    try:
+        lines = content.splitlines()
+        filtered = []
+        framework_prefixes = (
+            "at org.springframework.", "at org.apache.", "at jakarta.servlet.",
+            "at javax.servlet.", "at sun.reflect.", "at java.base/",
+            "at node:internal/", "at express/lib/", "at module.js:"
+        )
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Keep log level indicators and exception declarations
+            if any(kw in stripped for kw in ("ERROR", "FATAL", "Exception", "Caused by:", "Error:", "FAIL")):
+                filtered.append(line.rstrip())
+                continue
+            # Keep stack trace lines except framework noise
+            if stripped.startswith("at "):
+                if not any(stripped.startswith(prefix) for prefix in framework_prefixes):
+                    filtered.append(line.rstrip())
+                continue
+            # Keep general non-framework lines
+            filtered.append(line.rstrip())
+
+        if len(filtered) > max_lines:
+            head = filtered[:max_lines - 20]
+            tail = filtered[-20:]
+            omitted = len(filtered) - max_lines
+            filtered = head + [f"... [{omitted} framework/verbose log lines omitted to conserve tokens] ..."] + tail
+
+        return "\n".join(filtered)
+    except Exception:
+        return strip_generic_whitespace(content)
 
 def compress_html_xml(content: str) -> str:
     """Strip HTML/XML comments and collapse multi-line whitespace."""
@@ -246,6 +292,8 @@ def compress_code_snippet(content: str, filename: str = "") -> Tuple[str, int, i
         compressed = compress_tabular_data(content)
     elif ext in (".md", ".mdx", ".txt"):
         compressed = compress_markdown(content)
+    elif ext == ".log":
+        compressed = compress_log_file(content)
     else:
         compressed = compress_aggressive_fallback(content)
 

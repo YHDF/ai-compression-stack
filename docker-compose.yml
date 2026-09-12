@@ -34,7 +34,7 @@ services:
       - ANTHROPIC_BASE_URL=http://headroom:8787
       - OPENAI_BASE_URL=http://headroom:8787/v1
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - PYTHONPATH=/app
+      - PYTHONPATH=/app/src
     volumes:
       - ${AGY_BIN_PATH:-${HOST_HOME}/.local/bin/agy}:/usr/local/bin/agy:ro
       - ${HOST_LOCAL_PATH:-${HOST_HOME}/.local}:/home/appuser/.local:ro
