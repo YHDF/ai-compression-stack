@@ -20,10 +20,10 @@ User Prompt (Open WebUI / API)
       Local Ollama (0 Cloud Tokens) inspects /workspace file tree and auto-selects target files.
            │
            ▼
-[ AST Code Compression Engine ]
-    - Parses target files using Python AST (ast_compressor.py)
-    - Strips docstrings, comments, redundant blank lines, and whitespace
-    - Slashes input context tokens by 30% to 55%
+[ AST Code & Log Compression Engine ]
+    - Parses target files using Python AST & multi-language regex minifiers (ast_compressor.py)
+    - Strips docstrings, comments, redundant blank lines, brace whitespace, and framework log noise
+    - Slashes input context tokens by 30% to 55% (and log token bloat by 50%–90%)
     - Pre-injects compressed code into "## Workspace Pre-Read Context"
            │
            ▼
@@ -33,6 +33,7 @@ User Prompt (Open WebUI / API)
     - Equipped with zero-cost in-flight MCP tools:
         • trace_symbol: Multi-language (Java, Python, TypeScript) symbol, Spring bean, and call-site tracer
         • ask_local_assistant: Workspace-grounded code retrieval and drafting via local Ollama (0 cloud tokens)
+        • run_command: Sandboxed shell runner with programmatic test execution interceptors
            │
            ▼
 [ Execution or Local Fallback ]
@@ -57,11 +58,11 @@ flowchart TD
     CheckVision -->|Yes| GeminiVision["Gemini 2.5 Flash / Vision Fallback"]
     CheckVision -->|No| AutoDiscover
 
-    AutoDiscover --> ASTCompress["2. AST Compression Engine<br>• Strip comments, docstrings & whitespace<br>• Save 30% - 55% input tokens"]
+    AutoDiscover --> ASTCompress["2. AST & Log Compression Engine<br>• Strip comments, docstrings & whitespace<br>• Filter framework log stacktraces<br>• Save 30% - 55% input tokens"]
 
     ASTCompress --> PreRead["3. Inject Pre-Read Context<br>## Workspace Pre-Read Context"]
 
-    PreRead --> DispatchAgy["4. Dispatch agy with MCP Tools<br>• write_to_file / run_command<br>• trace_symbol (AST call tracer)<br>• ask_local_assistant (Local Ollama)"]
+    PreRead --> DispatchAgy["4. Dispatch agy with MCP Tools<br>• write_to_file / delete_file / run_command<br>• trace_symbol (AST call tracer)<br>• ask_local_assistant (Local Ollama)"]
 
     DispatchAgy --> CheckStatus{"agy Result Code"}
 
@@ -90,6 +91,27 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 
 ---
 
+## Codebase Directory Layout (`services/router`)
+
+The router service follows a clean enterprise architecture separating source modules from automated test suites:
+
+```text
+services/router/
+├── Dockerfile
+├── requirements.txt
+├── src/
+│   ├── __init__.py
+│   ├── app.py                   # FastAPI Gateway & Quota Router
+│   ├── ast_compressor.py        # Multi-Format AST Code & Log Compressor
+│   └── mcp_workspace.py         # Headless Zero-Cost MCP Tool Server
+└── tests/
+    ├── __init__.py
+    ├── test_ast_compressor.py   # AST Compression Unit Tests (15 tests)
+    └── test_mcp_workspace.py    # MCP Tool & Guardrail Unit Tests (8 tests)
+```
+
+---
+
 ## Multi-Agent Personas
 
 The stack natively supports specialized personas declared in `.antigravity/agents/`:
@@ -113,9 +135,10 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
 ## Key Features
 
 - **Upfront Workspace Auto-Discovery**: Prompt in plain English (e.g. `@coder Add user authentication`) without manually listing file paths. Local Ollama automatically detects the target files from `/workspace` file tree at **0 cloud tokens**.
-- **Multi-Format Code Compression Engine (`ast_compressor.py`)**: Automatically minifies target context across multiple languages and data formats before passing context to `agy`, slashing token consumption by **25% to 55%**:
+- **Multi-Format Code & Log Compression Engine (`ast_compressor.py`)**: Automatically minifies target context across multiple languages and data formats before passing context to `agy`, slashing token consumption by **30% to 55%**:
   - **Python (`.py`)**: AST-based docstring, comment, and whitespace minification.
-  - **JS / TS / C / C++ / Java / Go / Rust / C# / PHP (`.js`, `.ts`, `.jsx`, `.tsx`, `.c`, `.cpp`, `.go`, `.rs`, `.java`, `.cs`, `.php`, `.vue`, `.svelte`)**: String-aware comment stripping (`//`, `/* */`) and blank line elimination.
+  - **JS / TS / C / C++ / Java / Go / Rust / C# / PHP (`.js`, `.ts`, `.jsx`, `.tsx`, `.c`, `.cpp`, `.go`, `.rs`, `.java`, `.cs`, `.php`, `.vue`, `.svelte`)**: String-aware comment stripping (`//`, `/* */`), brace/semicolon/comma line collapsing, and blank line elimination.
+  - **Log Files & Stacktraces (`.log`)**: Filters Spring Boot & Node.js logs — strips framework reflection noise (`org.springframework...`, `sun.reflect...`) while preserving exception headers, `Caused by:` root causes, and user application frames (**50% – 90% token savings**).
   - **JSON (`.json`)**: Whitespace and newline minification.
   - **HTML / XML / SVG (`.html`, `.htm`, `.xml`, `.svg`)**: Comment (`<!-- -->`) removal and tag-gap collapsing.
   - **CSS / SCSS / SASS (`.css`, `.scss`, `.sass`, `.less`)**: Comment stripping and whitespace compression.
@@ -126,14 +149,38 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
   - **Markdown (`.md`, `.mdx`, `.txt`)**: Comment removal and excessive blank line compaction.
 - **In-Flight Zero-Cost MCP Tools (`mcp_workspace.py`)**:
   - `write_to_file`: Headless file creations and non-destructive edits.
-  - `run_command`: Sandboxed command runner with hard programmatic interceptors blocking test executions (`mvn test`, `pytest`, etc.) to prevent context window saturation.
+  - `run_command`: Sandboxed command runner with hard programmatic interceptors blocking test executions across Java (`mvn`, `gradle`), JS/TS (`jest`, `vitest`, `mocha`, `playwright`, `cypress`), Python (`pytest`, `unittest`), Go, Rust, and .NET.
   - `trace_symbol`: Fast multi-language symbol tracer supporting Java (classes, interfaces, Spring beans, methods), Python (AST), and TypeScript.
   - `ask_local_assistant`: Query local Ollama (`qwen2.5-coder:1.5b`) grounded with automated workspace snippet retrieval for signatures, mock patterns, and code/boilerplate drafting (0 cloud tokens).
   - `delete_file`: Safe single or batch deletion of obsolete files/directories within `/workspace`.
 - **Fast Convergence**: Enforces multi-file batching so agent actions complete within 2 turns rather than serial multi-minute round trips.
 - **Real-Time Telemetry (`/stats`)**: Query `http://localhost:8088/stats` for live cumulative statistics on AST tokens saved, requests processed, and Headroom proxy cache metrics.
-- **Headroom Upstream Pass-Through**: Direct connections from Open WebUI to `http://headroom:8787/v1` or the `headroom-proxy` model for prefix caching and prompt optimization on standard models.
-- **Quota & Timeout Protection**: Automatically catches CLI 429 quota limits, rate limits, or cold-start timeouts and fails over to local Ollama in real time.
+
+---
+
+## Recommended Local Ollama Models per Hardware Specs
+
+| Hardware Tier | System RAM / VRAM | GPU / CPU Target | Recommended Ollama Model | Quantization | RAM / VRAM Footprint | Performance & Use Case |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Ultra Light / CPU-only** | 8 GB RAM (0 GB VRAM) | Dual-core / Quad-core CPU | `qwen2.5-coder:0.5b` | `Q4_K_M` | ~350 MB | Ultra-fast (~40 t/s on CPU). Ideal for instant signature lookups on low-spec devices. |
+| **Standard / Lightweight** *(Default)* | 8–16 GB RAM (2–4 GB VRAM) | Integrated GPU / Entry Card (GTX 1650 / M1) | `qwen2.5-coder:1.5b` | `Q4_K_M` | ~1.1 GB | Excellent balance (~50–80 t/s). Instant local code drafting and snippet retrieval. |
+| **Intermediate Workstation** | 16–32 GB RAM (6–8 GB VRAM) | Mid-range GPU (RTX 3060/4060 / M2-M3 16GB) | `qwen2.5-coder:7b` | `Q4_K_M` | ~4.5 GB | High reasoning accuracy. Great at multi-file mock generation and unit test drafting. |
+| **High Performance** | 32–64 GB RAM (12–16 GB VRAM) | High-end GPU (RTX 3080/4080 / M2/M3 Pro 32GB) | `qwen2.5-coder:14b` or `deepseek-coder-v2:16b` | `Q4_K_M` | ~9.0 GB | Near-cloud reasoning quality. Performs structural refactoring & complex local code generation. |
+| **Enterprise Workstation** | 64+ GB RAM (24+ GB VRAM) | Top-tier GPU (RTX 3090/4090 / M2-M3 Ultra 64GB+) | `qwen2.5-coder:32b` or `codestral:22b` | `Q4_K_M` / `Q8_0` | ~20 GB | State-of-the-art local coding capability. Rivals top cloud models on local code generation. |
+
+---
+
+## Testing & Verification
+
+Run the full 23-test suite inside the Docker container:
+
+```bash
+docker compose run --rm -v "${PWD}/services/router:/app" -e PYTHONPATH=/app/src router python -m unittest discover -s tests
+```
+
+### Test Suite Breakdown:
+- **`tests/test_ast_compressor.py` (15 tests)**: Verifies AST docstring stripping, aggressive C-family newline/brace collapsing, Spring Boot log stacktrace filtering, and multi-format minification.
+- **`tests/test_mcp_workspace.py` (8 tests)**: Verifies `ask_local_assistant` zero-cost Ollama queries, `trace_symbol` multi-language tracing, `run_command` test execution blocking, and `apply_guardrails` prompt enforcement.
 
 ---
 
@@ -223,46 +270,6 @@ curl -s -X POST http://localhost:8088/v1/chat/completions \
     ]
   }'
 ```
-
-### 4. Recommended Prompt Templates (Open WebUI)
-
-To maximize AST compression, guarantee instant file pre-reading, and prevent agent search loops or timeouts, use this structured prompt pattern:
-
-#### Universal Template (Copy & Fill)
-````markdown
-@[coder|reviewer|architect]
-Target Files: [relative/path/to/target_file.ext]
-
-Task:
-[One-sentence summary of the task]
-
-Specification:
-- In `[target_file]`, locate `[function_or_code_block]`.
-- Modify/implement [exact behavior change or requirement].
-- Output / Return behavior: [data types, return value, or format].
-
-Constraints:
-- Produce minimal targeted diffs; preserve untouched code and formatting.
-- Verify syntax statically. Do not execute test builds (provide the test command under Next Steps).
-````
-
-#### Example (Sample Task)
-````markdown
-@coder
-Target Files: services/auth/token_manager.py
-
-Task:
-Add automatic expiration validation to the session token decoder.
-
-Specification:
-- In `services/auth/token_manager.py`, locate the `verify_session()` function.
-- Check if `payload["exp"]` is older than the current UTC timestamp.
-- If expired, raise a `TokenExpiredException("Session token has expired")`.
-
-Constraints:
-- Do not modify existing cryptographic signature checks.
-- Verify logic statically; report the pytest command under Next Steps for local execution.
-````
 
 ---
 
