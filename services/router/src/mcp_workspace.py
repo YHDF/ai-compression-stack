@@ -90,11 +90,20 @@ def handle_run_command(args: dict) -> dict:
     # Strict token preservation: block all test runner commands (including single test methods)
     lowered_cmd = cmd_str.strip().lower()
     test_block_patterns = [
-        r"\bmvn\b.*?\b(test|verify|-dtest)\b",
-        r"\bgradlew?\b.*?\b(test|check|--tests)\b",
+        # Java Ecosystem Test Runners
+        r"\b(mvn|\./mvnw|mvnw)\b.*?\b(test|verify|surefire|failsafe|-dtest)\b",
+        r"\b(gradle|\./gradlew|gradlew)\b.*?\b(test|check|--tests)\b",
+        r"\b(junit|testng)\b",
+
+        # JS / TS Ecosystem Test Runners
+        r"\b(npm|yarn|pnpm|bun)\b.*?\b(test|run\s+test|t)\b",
+        r"\b(jest|vitest|mocha|jasmine|karma|cypress|playwright|ava)\b",
+        r"\bnpx\s+(jest|vitest|mocha|cypress|playwright)\b",
+
+        # Python, Go, Rust, .NET Test Runners
         r"\bpytest\b",
-        r"\bpython\b.*?\b-m\s+(unittest|pytest)\b",
-        r"\b(npm|yarn|pnpm|bun)\b.*?\b(test|run\s+test)\b",
+        r"\bunittest\b",
+        r"\bpython\d*\b.*?\b-m\s+(unittest|pytest)\b",
         r"\bgo\b\s+test\b",
         r"\bcargo\b\s+test\b",
         r"\bdotnet\b\s+test\b",
