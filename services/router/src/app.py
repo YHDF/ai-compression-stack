@@ -440,12 +440,12 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     guardrails = (
         "## Operational Boundaries & Guardrails:\n"
         "- MANDATORY DISK WRITE VIA TOOLS (CRITICAL): You are an autonomous software engineer equipped with direct workspace tools ('write_to_file', 'replace_file_content', 'delete_file', 'run_command'). You MUST execute the tools to persist all created or modified files directly to disk in /workspace. Merely returning code blocks in markdown without invoking the filesystem tools is STRICTLY FORBIDDEN and considered an execution failure.\n"
-        "- Path Convention: File paths for 'write_to_file' must be relative to /workspace or absolute starting with /workspace (e.g. 'update_tr_consents.js' or '/workspace/update_tr_consents.js').\n"
+        "- Path Convention: File paths for 'write_to_file' must be relative to /workspace or absolute starting with /workspace (e.g. 'scripts/processor.py' or '/workspace/scripts/processor.py').\n"
         "- Scope: Modify strictly the files required to fulfill the specification.\n"
-        "- Fast Convergence: You MUST complete all file modifications in at most 2 turns. Do NOT perform exploratory searches or repeat failed tool calls.\n"
+        "- Fast Convergence: You MUST complete all file modifications in Turn 1 (at most 2 turns for complex multi-file refactors). Do NOT perform exploratory searches or repeat failed tool calls.\n"
         "- Zero Search Loops: Never call cloud-billed grep_search or dump unneeded files with view_file. Target files and pre-read context are already provided.\n"
         "- Mandatory Local Inquiries (0 Cloud Tokens): To discover class/method signatures, bean types, or mock patterns, you MUST call 'trace_symbol' (supports Java, Python, TS) or 'ask_local_assistant' (grounded with local workspace retrieval). Zero cloud tokens are consumed.\n"
-        "- Mandatory Local Code Drafting: For new test cases, mock fixtures, and boilerplate, ALWAYS invoke 'ask_local_assistant' to draft the implementation using local Ollama (qwen2.5-coder:1.5b) before applying edits to /workspace.\n"
+        "- Single-Turn Direct Write (Quota Preservation): For new scripts, standalone utilities, and unit tests, generate and write the code directly to disk using 'write_to_file' in Turn 1. Do NOT initiate pre-drafting rounds via 'ask_local_assistant' when the specification is self-contained. Persist files immediately.\n"
         "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running any test suites, test runners, or individual test methods (e.g., 'mvn test', 'mvn -Dtest=...', 'gradle test', 'pytest', 'npm test'). Write the test cases to disk with 'write_to_file', verify syntax and interface contracts purely via static inspection, and instruct the user to execute tests locally under Next Steps.\n"
         "- Formatting Lock: Strictly maintain existing code style, tab indentation, and minimal diffs.\n\n"
     )
@@ -458,7 +458,7 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
 def auto_persist_code_blocks(output_text: str, workspace_dir: str):
     """
     Safety net: Parses output text for code deliverables that were returned in markdown
-    rather than executed via tools, and writes them directly to disk if absent.
+    rather than executed via tools, and writes them directly to disk.
     """
     if not output_text or not os.path.exists(workspace_dir):
         return
@@ -467,7 +467,7 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str):
     from mcp_workspace import normalize_path
 
     pattern = re.compile(
-        r"(?:^|\n)(?:#{1,6}\s*(?:\d+\.?)?\s*\[?`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?\]?|File:\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?).*?\n+```[a-zA-Z0-9_-]*\n(.*?)```",
+        r"(?:^|\n)(?:#{1,6}\s*(?:\d+\.?)?\s*\[?`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?\]?|(?:File:|\*{1,2}File:\*{1,2})\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?|\*{1,2}([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)\*{1,2}:?|`([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`:?).*?\n+```[a-zA-Z0-9_-]*\n(.*?)```",
         re.DOTALL
     )
 
@@ -475,15 +475,15 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str):
     ws_root = Path(workspace_dir).resolve()
 
     for match in pattern.finditer(output_text):
-        fname = match.group(1) or match.group(2)
-        code = match.group(3)
+        fname = match.group(1) or match.group(2) or match.group(3) or match.group(4)
+        code = match.group(5)
         if not fname or not code:
             continue
 
         clean_name = fname.strip().replace("file://", "").strip()
         if "](" in clean_name:
             clean_name = clean_name.split("](")[0]
-        clean_name = clean_name.strip("`'\"[]()")
+        clean_name = clean_name.strip("`'\"[]()*:")
 
         resolved = normalize_path(clean_name)
         already_exists = resolved.exists()
@@ -502,14 +502,13 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str):
             except Exception as e:
                 print(f"[ROUTER] Notice merging package.json: {e}", flush=True)
 
-        if not already_exists:
-            try:
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(code, encoding="utf-8")
-                persisted.append(str(resolved.relative_to(ws_root)))
-                print(f"[ROUTER] Auto-persisted missing deliverable to disk: {resolved}", flush=True)
-            except Exception as e:
-                print(f"[ROUTER] Failed to auto-persist {resolved}: {e}", flush=True)
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(code, encoding="utf-8")
+            persisted.append(str(resolved.relative_to(ws_root)))
+            print(f"[ROUTER] Auto-persisted deliverable to disk: {resolved}", flush=True)
+        except Exception as e:
+            print(f"[ROUTER] Failed to auto-persist {resolved}: {e}", flush=True)
 
     if persisted:
         print(f"[ROUTER] Successfully auto-persisted {len(persisted)} deliverables: {', '.join(persisted)}", flush=True)
@@ -660,6 +659,11 @@ def completions(req: ChatCompletionRequest):
 
         # Automatic fallback to local Ollama on failure/timeout
         fallback_out = call_ollama_generation(clean_prompt or prompt_text)
+        if fallback_out:
+            try:
+                auto_persist_code_blocks(fallback_out, WORKSPACE_DIR)
+            except Exception as e:
+                print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
 
     # 2. Multimodal / Vision Bypass
@@ -749,6 +753,11 @@ def completions(req: ChatCompletionRequest):
         target = f"Fallback Local Ollama ({OLLAMA_MODEL})"
         print(f"[ROUTER] Target: {target}", flush=True)
         fallback_out = call_ollama_generation(beautified)
+        if fallback_out:
+            try:
+                auto_persist_code_blocks(fallback_out, WORKSPACE_DIR)
+            except Exception as e:
+                print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
 
     # 5. Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
