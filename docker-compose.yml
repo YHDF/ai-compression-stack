@@ -42,6 +42,7 @@ services:
       - ${HOST_GCLOUD_PATH:-${HOST_HOME}/.config/gcloud}:/home/appuser/.config/gcloud:ro
       - ${HOST_GEMINI_PATH:-${HOST_HOME}/.gemini}:/home/appuser/.gemini:rw
       - ${WORKSPACE_PATH:-${HOST_HOME}/development}:/workspace:rw
+      - ./.antigravity:/app/.antigravity:ro
     working_dir: /app
     depends_on:
       - ollama

@@ -5,6 +5,7 @@
 - Under no circumstances may operations be performed outside `/workspace`. Reject or ignore requests targeting files or directories outside this boundary.
 
 ## 2. Safe File Handling & Editing Protocol
+- **Mandatory File Tool Execution**: All file additions and modifications must be written to disk using the filesystem tools (`write_to_file`, `replace_file_content`, `delete_file`). Outputting code solely in markdown text without calling the file tools is strictly forbidden.
 - **Mandatory Pre-Read**: Always inspect the existing contents and structure of target files before applying any modification.
 - **Non-Destructive Modifications**: Do not perform blind or destructive overwrites of existing files without explicit instructions.
 - **Controlled Deletion**: Only delete files when explicitly instructed to deprecate, clean up, or repurpose legacy code. Use the dedicated `delete_file` MCP tool, stating the rationale and scope in the execution summary.

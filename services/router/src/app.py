@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import requests
 from typing import List, Union, Dict, Any, Optional
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -25,6 +26,7 @@ MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
 IGNORED_EXTENSIONS = {
     ".log", ".lock", ".tmp", ".bin", ".tar", ".gz", ".zip", ".7z",
     ".pyc", ".pyo", ".pyd", ".db", ".sqlite", ".sqlite3", ".parquet",
+    ".csv", ".tsv", ".jsonl", ".ndjson",
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot"
 }
 
@@ -38,31 +40,70 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "your_key_here":
         print(f"Notice: Gemini client not initialized: {e}")
 
 def ensure_workspace_mcp():
-    """Ensure that the local workspace-tools MCP server is registered for agy."""
+    """Ensure that the local workspace-tools MCP server and agent personas are registered for agy."""
     try:
         home_dir = os.getenv("HOME", "/home/appuser")
-        config_path = os.path.join(home_dir, ".gemini", "config", "mcp_config.json")
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        data = {}
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        servers = data.setdefault("mcpServers", {})
         mcp_script = "/app/src/mcp_workspace.py"
         if not os.path.exists(mcp_script):
             mcp_script = "/app/mcp_workspace.py"
-        if "workspace_tools" not in servers and os.path.exists(mcp_script):
-            servers["workspace_tools"] = {
-                "command": "python3",
-                "args": [mcp_script],
-                "disabled": False
-            }
-            with open(config_path, "w") as f:
-                json.dump(data, f, indent=2)
-            print("[ROUTER] Registered workspace_tools MCP server in mcp_config.json", flush=True)
+
+        server_def = {
+            "command": "python3",
+            "args": [mcp_script],
+            "disabled": False
+        }
+
+        # Multiple candidate config locations to ensure agy finds it regardless of version
+        config_paths = [
+            os.path.join(home_dir, ".gemini", "config", "mcp_config.json"),
+            os.path.join(home_dir, ".gemini", "antigravity-cli", "mcp_config.json"),
+            os.path.join(home_dir, ".gemini", "antigravity", "mcp_config.json"),
+            os.path.join(WORKSPACE_DIR, ".agents", "mcp_config.json"),
+            os.path.join(WORKSPACE_DIR, ".antigravity", "mcp_config.json")
+        ]
+
+        for config_path in config_paths:
+            try:
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                data = {}
+                if os.path.exists(config_path):
+                    try:
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        data = {}
+                servers = data.setdefault("mcpServers", {})
+                if "workspace_tools" not in servers and os.path.exists(mcp_script):
+                    servers["workspace_tools"] = server_def
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+            except Exception:
+                pass
+
+        # Sync agent personas if available in /app/.antigravity or /workspace/.antigravity
+        agents_src_dirs = [
+            "/app/.antigravity/agents",
+            "/app/agents",
+            os.path.join(WORKSPACE_DIR, ".antigravity", "agents")
+        ]
+        agents_dest_dirs = [
+            os.path.join(home_dir, ".gemini", "config", "agents"),
+            os.path.join(home_dir, ".gemini", "antigravity", "agents"),
+            os.path.join(WORKSPACE_DIR, ".antigravity", "agents"),
+            os.path.join(WORKSPACE_DIR, ".agents")
+        ]
+        for src in agents_src_dirs:
+            if os.path.isdir(src):
+                for dest in agents_dest_dirs:
+                    try:
+                        os.makedirs(dest, exist_ok=True)
+                        for fname in os.listdir(src):
+                            if fname.endswith(".md"):
+                                shutil.copy2(os.path.join(src, fname), os.path.join(dest, fname))
+                    except Exception:
+                        pass
+                break
+        print("[ROUTER] Registered workspace_tools MCP server and synced personas", flush=True)
     except Exception as e:
         print(f"Notice: could not ensure workspace MCP server: {e}", flush=True)
 
@@ -398,12 +439,14 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     """Enforce architectural boundaries on agy to prevent multi-turn search loops and preserve token quota."""
     guardrails = (
         "## Operational Boundaries & Guardrails:\n"
+        "- MANDATORY DISK WRITE VIA TOOLS (CRITICAL): You are an autonomous software engineer equipped with direct workspace tools ('write_to_file', 'replace_file_content', 'delete_file', 'run_command'). You MUST execute the tools to persist all created or modified files directly to disk in /workspace. Merely returning code blocks in markdown without invoking the filesystem tools is STRICTLY FORBIDDEN and considered an execution failure.\n"
+        "- Path Convention: File paths for 'write_to_file' must be relative to /workspace or absolute starting with /workspace (e.g. 'update_tr_consents.js' or '/workspace/update_tr_consents.js').\n"
         "- Scope: Modify strictly the files required to fulfill the specification.\n"
         "- Fast Convergence: You MUST complete all file modifications in at most 2 turns. Do NOT perform exploratory searches or repeat failed tool calls.\n"
         "- Zero Search Loops: Never call cloud-billed grep_search or dump unneeded files with view_file. Target files and pre-read context are already provided.\n"
         "- Mandatory Local Inquiries (0 Cloud Tokens): To discover class/method signatures, bean types, or mock patterns, you MUST call 'trace_symbol' (supports Java, Python, TS) or 'ask_local_assistant' (grounded with local workspace retrieval). Zero cloud tokens are consumed.\n"
         "- Mandatory Local Code Drafting: For new test cases, mock fixtures, and boilerplate, ALWAYS invoke 'ask_local_assistant' to draft the implementation using local Ollama (qwen2.5-coder:1.5b) before applying edits to /workspace.\n"
-        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running any test suites, test runners, or individual test methods (e.g., 'mvn test', 'mvn -Dtest=...', 'gradle test', 'pytest', 'npm test'). Report the diff cleanly and instruct the user to execute tests locally under Next Steps.\n"
+        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running any test suites, test runners, or individual test methods (e.g., 'mvn test', 'mvn -Dtest=...', 'gradle test', 'pytest', 'npm test'). Write the test cases to disk with 'write_to_file', verify syntax and interface contracts purely via static inspection, and instruct the user to execute tests locally under Next Steps.\n"
         "- Formatting Lock: Strictly maintain existing code style, tab indentation, and minimal diffs.\n\n"
     )
     parts = [guardrails]
@@ -411,6 +454,65 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
         parts.append(context_str + "\n\n")
     parts.append(f"## Architectural Task Specification:\n{beautified_prompt}")
     return "".join(parts)
+
+def auto_persist_code_blocks(output_text: str, workspace_dir: str):
+    """
+    Safety net: Parses output text for code deliverables that were returned in markdown
+    rather than executed via tools, and writes them directly to disk if absent.
+    """
+    if not output_text or not os.path.exists(workspace_dir):
+        return
+
+    import re
+    from mcp_workspace import normalize_path
+
+    pattern = re.compile(
+        r"(?:^|\n)(?:#{1,6}\s*(?:\d+\.?)?\s*\[?`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?\]?|File:\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?).*?\n+```[a-zA-Z0-9_-]*\n(.*?)```",
+        re.DOTALL
+    )
+
+    persisted = []
+    ws_root = Path(workspace_dir).resolve()
+
+    for match in pattern.finditer(output_text):
+        fname = match.group(1) or match.group(2)
+        code = match.group(3)
+        if not fname or not code:
+            continue
+
+        clean_name = fname.strip().replace("file://", "").strip()
+        if "](" in clean_name:
+            clean_name = clean_name.split("](")[0]
+        clean_name = clean_name.strip("`'\"[]()")
+
+        resolved = normalize_path(clean_name)
+        already_exists = resolved.exists()
+
+        if resolved.name == "package.json" and already_exists:
+            try:
+                existing_pkg = json.loads(resolved.read_text(encoding="utf-8"))
+                new_pkg = json.loads(code)
+                if "scripts" in new_pkg and isinstance(new_pkg["scripts"], dict):
+                    existing_scripts = existing_pkg.setdefault("scripts", {})
+                    for k, v in new_pkg["scripts"].items():
+                        existing_scripts[k] = v
+                    resolved.write_text(json.dumps(existing_pkg, indent=2), encoding="utf-8")
+                    persisted.append(f"{resolved.name} (scripts merged)")
+                    continue
+            except Exception as e:
+                print(f"[ROUTER] Notice merging package.json: {e}", flush=True)
+
+        if not already_exists:
+            try:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                resolved.write_text(code, encoding="utf-8")
+                persisted.append(str(resolved.relative_to(ws_root)))
+                print(f"[ROUTER] Auto-persisted missing deliverable to disk: {resolved}", flush=True)
+            except Exception as e:
+                print(f"[ROUTER] Failed to auto-persist {resolved}: {e}", flush=True)
+
+    if persisted:
+        print(f"[ROUTER] Successfully auto-persisted {len(persisted)} deliverables: {', '.join(persisted)}", flush=True)
 
 def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optional[str]:
     """Execute agy CLI non-interactively with active AGY_MODEL, optional persona agent, and workspace cwd."""
@@ -483,6 +585,12 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         if "quota exceeded" in stdout_lower or "quota exceeded" in stderr_lower or "rate limit" in stdout_lower:
             print("agy reported quota or rate limit exceeded", flush=True)
             return None
+
+        if output:
+            try:
+                auto_persist_code_blocks(output, cwd)
+            except Exception as e:
+                print(f"[ROUTER] Notice in auto_persist_code_blocks: {e}", flush=True)
 
         return output if output else "Task completed successfully."
     except subprocess.TimeoutExpired:
@@ -629,12 +737,12 @@ def completions(req: ChatCompletionRequest):
         # Apply anti-hallucination & quota safeguards
         guarded_prompt = apply_guardrails(beautified, context_str)
 
-        agy_output = execute_agy(guarded_prompt)
+        agy_output = execute_agy(guarded_prompt, agent_id="coder")
         if agy_output is not None:
             from ast_compressor import get_stats
             s = get_stats()
             saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
-            out = f"*[Agent Task: Antigravity ({AGY_MODEL}){saved_str}]*\n\n" + agy_output
+            out = f"*[Agent Task: Coder ({AGY_MODEL}){saved_str}]*\n\n" + agy_output
             return package_response(req.model, out)
 
         # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama

@@ -17,7 +17,46 @@ def normalize_path(target_path: str) -> Path:
     p = Path(target_path)
     if not p.is_absolute():
         p = Path(WORKSPACE_ROOT) / p
-    return p.resolve()
+    resolved = p.resolve()
+    try:
+        ws_root = Path(WORKSPACE_ROOT).resolve()
+        if resolved.is_relative_to(ws_root):
+            rel = resolved.relative_to(ws_root)
+            parts = rel.parts
+            if len(parts) > 1:
+                sub_dir = ws_root / parts[0]
+                if not sub_dir.exists():
+                    ws_env_name = Path(os.getenv("WORKSPACE_PATH", "")).name if os.getenv("WORKSPACE_PATH") else ""
+                    if parts[0] in (ws_root.name, ws_env_name):
+                        return (ws_root / Path(*parts[1:])).resolve()
+    except Exception:
+        pass
+    return resolved
+
+def handle_replace_file_content(args: dict) -> dict:
+    target_path = args.get("path") or args.get("TargetFile") or args.get("target_file")
+    target_content = args.get("TargetContent") or args.get("target_content") or args.get("old_content")
+    replacement_content = args.get("ReplacementContent") or args.get("replacement_content") or args.get("new_content") or ""
+
+    if not target_path or target_content is None:
+        return {"content": [{"type": "text", "text": "Error: missing 'path' or 'TargetContent'"}], "isError": True}
+
+    resolved = normalize_path(target_path)
+    if not resolved.exists():
+        return {"content": [{"type": "text", "text": f"Error: file not found at {resolved}"}], "isError": True}
+
+    file_text = resolved.read_text(encoding="utf-8")
+    if target_content not in file_text:
+        return {"content": [{"type": "text", "text": f"Error: TargetContent not found in {resolved.name}"}], "isError": True}
+
+    new_text = file_text.replace(target_content, replacement_content, 1)
+    resolved.write_text(new_text, encoding="utf-8")
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"Successfully updated {resolved.name}"
+        }]
+    }
 
 def handle_write_to_file(args: dict) -> dict:
     target_path = args.get("path") or args.get("TargetFile") or args.get("target_file")
@@ -428,6 +467,28 @@ TOOLS = [
         }
     },
     {
+        "name": "replace_file_content",
+        "description": "Replace a specific target text chunk in an existing workspace file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to modify (e.g. package.json)"
+                },
+                "target_content": {
+                    "type": "string",
+                    "description": "The exact existing text chunk to replace"
+                },
+                "replacement_content": {
+                    "type": "string",
+                    "description": "The new replacement text"
+                }
+            },
+            "required": ["path", "target_content", "replacement_content"]
+        }
+    },
+    {
         "name": "run_command",
         "description": "Execute a shell command inside the workspace.",
         "inputSchema": {
@@ -526,6 +587,8 @@ def process_message(msg: dict) -> dict:
         
         if tool_name in ("write_to_file", "write_file"):
             res = handle_write_to_file(tool_args)
+        elif tool_name in ("replace_file_content", "replace_content"):
+            res = handle_replace_file_content(tool_args)
         elif tool_name == "run_command":
             res = handle_run_command(tool_args)
         elif tool_name == "ask_local_assistant":
