@@ -160,12 +160,28 @@ def package_response(model_name: str, content: str):
         ]
     }
 
-def call_ollama_generation(prompt: str, is_code_task: bool = True) -> str:
-    """Fallback or direct code generation using local Ollama model."""
-    print(f"[ROUTER] Invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
+def call_ollama_generation(prompt: str, persona: str = "coder", ws_context: str = "") -> str:
+    """Fallback or direct generation using local Ollama model tailored to persona and workspace context."""
+    print(f"[ROUTER] Invoking Ollama fallback (model={OLLAMA_MODEL}, persona={persona})", flush=True)
     try:
-        formatted_prompt = prompt
-        if is_code_task and "### [" not in prompt:
+        context_block = f"\n## Current Workspace Context:\n{ws_context}\n\n" if ws_context else ""
+        if persona == "reviewer":
+            directive = (
+                "## SYSTEM DIRECTIVE - CODE REVIEWER:\n"
+                "You are a senior code reviewer. Inspect the provided workspace context, detect bugs, edge cases, and architectural inconsistencies, and advise the user on next steps.\n"
+                "Do NOT invent unrelated projects (like games). Base all feedback strictly on the provided workspace files.\n\n"
+            )
+        elif persona == "architect":
+            directive = (
+                "## SYSTEM DIRECTIVE - SYSTEM ARCHITECT:\n"
+                "You are a lead system architect. Analyze the workspace context, outline architecture, component relationships, and specifications.\n\n"
+            )
+        elif persona == "tester":
+            directive = (
+                "## SYSTEM DIRECTIVE - TEST SPECIALIST:\n"
+                "You are a quality assurance and testing engineer. Formulate comprehensive test scenarios and unit test plans for the workspace code.\n\n"
+            )
+        else:
             directive = (
                 "## CRITICAL SYSTEM DIRECTIVE:\n"
                 "You are an autonomous code generator. All files must be persisted to the workspace.\n"
@@ -176,8 +192,8 @@ def call_ollama_generation(prompt: str, is_code_task: bool = True) -> str:
                 "```\n"
                 "Provide complete, functional code without omissions or placeholders.\n\n"
             )
-            formatted_prompt = directive + prompt
 
+        formatted_prompt = f"{directive}{context_block}Task / User Inquiry:\n{prompt}"
         payload = {
             "model": OLLAMA_MODEL,
             "prompt": formatted_prompt,
@@ -851,16 +867,16 @@ def process_chat_request(req: ChatCompletionRequest) -> str:
         return badge + agy_output
 
     # 6. Automatic Fallback to Local Ollama with Direct Workspace Disk Persistence
-    print(f"[ROUTER] agy failed or quota exhausted; invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
-    fallback_out = call_ollama_generation(synthesized_prompt)
+    print(f"[ROUTER] agy failed or quota exhausted; invoking Ollama fallback (model={OLLAMA_MODEL}, persona={selected_agent})", flush=True)
+    fallback_out = call_ollama_generation(synthesized_prompt, persona=selected_agent, ws_context=ws_context)
     saved_files = []
-    if fallback_out:
+    if fallback_out and selected_agent == "coder":
         try:
             saved_files = auto_persist_code_blocks(fallback_out, WORKSPACE_DIR, default_target_files=target_files)
         except Exception as e:
             print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
     saved_badge = f"\n\n*[Files saved to workspace: {', '.join(saved_files)}]*" if saved_files else ""
-    return "*[Fallback: Local Ollama]*" + saved_badge + "\n\n" + fallback_out
+    return f"*[Fallback: Local Ollama ({selected_agent.capitalize()})]*" + saved_badge + "\n\n" + fallback_out
 
 def generate_stream_response(req: ChatCompletionRequest):
     """Format response as live SSE stream with periodic keep-alive pings to prevent client timeout."""

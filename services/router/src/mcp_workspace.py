@@ -306,7 +306,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
             context = auto_snippets
 
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
     system_prompt = (
@@ -329,7 +329,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
         "prompt": full_prompt,
         "stream": False,
         "options": {
-            "num_predict": 4096,
+            "num_predict": 2048,
             "temperature": 0.2
         }
     }).encode("utf-8")
