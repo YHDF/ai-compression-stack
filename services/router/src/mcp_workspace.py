@@ -272,6 +272,7 @@ def retrieve_local_workspace_context(query: str, max_chars: int = 4000) -> str:
 
 def handle_ask_local_assistant(args: dict) -> dict:
     query = args.get("query") or args.get("prompt") or args.get("question") or ""
+    target_file = args.get("target_file") or args.get("path") or args.get("file_path") or args.get("TargetFile")
     context = args.get("context") or args.get("code") or ""
     if not query:
         return {"content": [{"type": "text", "text": "Error: missing required 'query' parameter"}], "isError": True}
@@ -284,15 +285,17 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
     ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
-    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "300"))
+    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
     system_prompt = (
-        "You are an embedded repository intelligence engine assisting a principal software engineer. "
-        "Provide direct, high-density technical analysis, interface contracts, symbol traces, mock patterns, or implementation code. "
-        "Base your answer strictly on the provided workspace context when available. "
-        "Omit conversational preambles, greetings, apologies, and stylistic commentary. "
-        "Ensure any returned code snippets are minimal and unembellished, with docstrings and comments omitted."
+        "You are an expert autonomous software engineer and implementation engine. "
+        "Generate complete, production-grade, functional code without omissions or placeholders. "
+        "Base your implementation on the provided workspace context when available. "
+        "Omit conversational preambles, chat greetings, and commentary. Return complete, functional code."
     )
+    if target_file:
+        system_prompt += f"\nYou are implementing the exact file: {target_file}. Return strictly the code for this file."
+
     full_prompt = f"{system_prompt}\n\n"
     if context:
         full_prompt += f"Context:\n{context}\n\n"
@@ -304,7 +307,7 @@ def handle_ask_local_assistant(args: dict) -> dict:
         "prompt": full_prompt,
         "stream": False,
         "options": {
-            "num_predict": 300,
+            "num_predict": 4096,
             "temperature": 0.2
         }
     }).encode("utf-8")
@@ -320,18 +323,29 @@ def handle_ask_local_assistant(args: dict) -> dict:
             data = json.loads(resp.read().decode("utf-8"))
             answer = data.get("response", "").strip()
 
-            # Post-process answer: strip comments/docstrings from code blocks if present
-            try:
-                from ast_compressor import compress_python_code
-                def repl(m):
-                    lang = m.group(1)
-                    code = m.group(2)
-                    if lang in ("python", "py", ""):
-                        return f"```{lang}\n{compress_python_code(code)}\n```"
-                    return m.group(0)
-                answer = re.sub(r"```([a-zA-Z0-9_-]*)\n(.*?)```", repl, answer, flags=re.DOTALL)
-            except Exception:
-                pass
+            # If target_file is specified, persist code directly to disk at 0 cloud cost!
+            if target_file:
+                code_to_write = answer
+                m = re.search(r"```[a-zA-Z0-9_\-\./]*\n(.*?)```", answer, re.DOTALL)
+                if m:
+                    code_to_write = m.group(1).strip()
+                else:
+                    if code_to_write.startswith("```"):
+                        code_to_write = re.sub(r"^```[a-zA-Z0-9_\-\./]*\n", "", code_to_write)
+                    if code_to_write.endswith("```"):
+                        code_to_write = code_to_write[:-3].rstrip()
+
+                resolved = normalize_path(target_file)
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                resolved.write_text(code_to_write, encoding="utf-8")
+                line_count = len(code_to_write.splitlines())
+                print(f"[MCP] Ollama generated and wrote {resolved} ({len(code_to_write)} bytes, {line_count} lines)", flush=True)
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": f"[Local Ollama (0 Cloud Tokens)]: Successfully generated and saved '{target_file}' ({line_count} lines, {len(code_to_write)} bytes) directly to disk in /workspace."
+                    }]
+                }
 
             return {"content": [{"type": "text", "text": f"[Local Ollama ({ollama_model} | 0 Cloud Tokens)]:\n{answer}"}]}
     except Exception as e:
@@ -504,17 +518,21 @@ TOOLS = [
     },
     {
         "name": "ask_local_assistant",
-        "description": "Query local zero-cost Ollama assistant (qwen2.5-coder:1.5b) grounded with workspace code retrieval for signatures, mock patterns, and code drafting without consuming cloud tokens.",
+        "description": "Generate implementation code, functions, test suites, or algorithms using local zero-cost Ollama (qwen2.5-coder:1.5b). If target_file is provided, writes the generated code directly to disk in /workspace at 0 cloud tokens.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The question, mock pattern request, or code drafting prompt to ask local Ollama"
+                    "description": "The specification, function requirements, or prompt for local Ollama to implement"
+                },
+                "target_file": {
+                    "type": "string",
+                    "description": "Optional file path in /workspace where the generated code should be saved directly (e.g. 'reach5-analytics/lib/reach5Client.js')"
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional code snippet or context to evaluate (auto-retrieves from workspace if empty)"
+                    "description": "Optional reference code, schemas, or context to evaluate"
                 }
             },
             "required": ["query"]

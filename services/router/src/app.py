@@ -17,9 +17,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 AGY_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-medium").strip()
-AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "300"))
+AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "600"))
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
@@ -47,6 +47,13 @@ def ensure_workspace_mcp():
         if not os.path.exists(mcp_script):
             mcp_script = "/app/mcp_workspace.py"
 
+        # Ensure symlink /app/mcp_workspace.py exists pointing to /app/src/mcp_workspace.py
+        try:
+            if os.path.exists("/app/src/mcp_workspace.py") and not os.path.exists("/app/mcp_workspace.py"):
+                os.symlink("/app/src/mcp_workspace.py", "/app/mcp_workspace.py")
+        except Exception:
+            pass
+
         server_def = {
             "command": "python3",
             "args": [mcp_script],
@@ -73,12 +80,25 @@ def ensure_workspace_mcp():
                     except Exception:
                         data = {}
                 servers = data.setdefault("mcpServers", {})
-                if "workspace_tools" not in servers and os.path.exists(mcp_script):
-                    servers["workspace_tools"] = server_def
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2)
+                servers["workspace_tools"] = server_def
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
             except Exception:
                 pass
+
+        # Also register directly via agy CLI if available
+        try:
+            agy_bin = shutil.which("agy") or "/usr/local/bin/agy"
+            if os.path.exists(agy_bin) and os.access(agy_bin, os.X_OK):
+                subprocess.run(
+                    [agy_bin, "mcp", "add", "workspace_tools", "python3", mcp_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False
+                )
+        except Exception:
+            pass
 
         # Sync agent personas if available in /app/.antigravity or /workspace/.antigravity
         agents_src_dirs = [
@@ -89,6 +109,7 @@ def ensure_workspace_mcp():
         agents_dest_dirs = [
             os.path.join(home_dir, ".gemini", "config", "agents"),
             os.path.join(home_dir, ".gemini", "antigravity", "agents"),
+            os.path.join(home_dir, ".gemini", "antigravity-cli", "agents"),
             os.path.join(WORKSPACE_DIR, ".antigravity", "agents"),
             os.path.join(WORKSPACE_DIR, ".agents")
         ]
@@ -135,13 +156,27 @@ def package_response(model_name: str, content: str):
         ]
     }
 
-def call_ollama_generation(prompt: str) -> str:
+def call_ollama_generation(prompt: str, is_code_task: bool = True) -> str:
     """Fallback or direct code generation using local Ollama model."""
     print(f"[ROUTER] Invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
     try:
+        formatted_prompt = prompt
+        if is_code_task and "### [" not in prompt:
+            directive = (
+                "## CRITICAL SYSTEM DIRECTIVE:\n"
+                "You are an autonomous code generator. All files must be persisted to the workspace.\n"
+                "For EVERY file you implement, you MUST prefix its code block with an explicit markdown header indicating the exact relative file path, formatted as:\n"
+                "### [path/to/filename.ext]\n"
+                "```language\n"
+                "<complete file content>\n"
+                "```\n"
+                "Provide complete, functional code without omissions or placeholders.\n\n"
+            )
+            formatted_prompt = directive + prompt
+
         payload = {
             "model": OLLAMA_MODEL,
-            "prompt": prompt,
+            "prompt": formatted_prompt,
             "stream": False
         }
         resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
@@ -439,15 +474,13 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     """Enforce architectural boundaries on agy to prevent multi-turn search loops and preserve token quota."""
     guardrails = (
         "## Operational Boundaries & Guardrails:\n"
-        "- MANDATORY DISK WRITE VIA TOOLS (CRITICAL): You are an autonomous software engineer equipped with direct workspace tools ('write_to_file', 'replace_file_content', 'delete_file', 'run_command'). You MUST execute the tools to persist all created or modified files directly to disk in /workspace. Merely returning code blocks in markdown without invoking the filesystem tools is STRICTLY FORBIDDEN and considered an execution failure.\n"
-        "- Path Convention: File paths for 'write_to_file' must be relative to /workspace or absolute starting with /workspace (e.g. 'scripts/processor.py' or '/workspace/scripts/processor.py').\n"
+        "- MANDATORY DISK WRITE VIA TOOLS (CRITICAL): You are equipped with direct workspace tools ('write_to_file', 'replace_file_content', 'delete_file', 'ask_local_assistant', 'trace_symbol'). All files must be persisted directly to disk in /workspace. Merely returning code blocks in markdown without persisting to disk is strictly forbidden.\n"
+        "- DIVISION OF LABOR (CRITICAL TO PRESERVE CLOUD QUOTA):\n"
+        "  1. Heavy Implementation & New Files: You MUST call 'ask_local_assistant(query=\"...\", target_file=\"path/to/file.ext\")' to have local Ollama generate and save the code directly to disk at ZERO cloud tokens. The tool will save the file to disk and return a confirmation. Do NOT generate hundreds of lines of code in your cloud output.\n"
+        "  2. Minimal Edits (< 5% Token Impact): Only if a change is very minimal (e.g. 1-5 line bug fix, small diff, or config tweak), you are authorized to use 'replace_file_content' or 'write_to_file' directly without Ollama.\n"
         "- Scope: Modify strictly the files required to fulfill the specification.\n"
-        "- Fast Convergence: You MUST complete all file modifications in Turn 1 (at most 2 turns for complex multi-file refactors). Do NOT perform exploratory searches or repeat failed tool calls.\n"
-        "- Zero Search Loops: Never call cloud-billed grep_search or dump unneeded files with view_file. Target files and pre-read context are already provided.\n"
-        "- Mandatory Local Inquiries (0 Cloud Tokens): To discover class/method signatures, bean types, or mock patterns, you MUST call 'trace_symbol' (supports Java, Python, TS) or 'ask_local_assistant' (grounded with local workspace retrieval). Zero cloud tokens are consumed.\n"
-        "- Single-Turn Direct Write (Quota Preservation): For new scripts, standalone utilities, and unit tests, generate and write the code directly to disk using 'write_to_file' in Turn 1. Do NOT initiate pre-drafting rounds via 'ask_local_assistant' when the specification is self-contained. Persist files immediately.\n"
-        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running any test suites, test runners, or individual test methods (e.g., 'mvn test', 'mvn -Dtest=...', 'gradle test', 'pytest', 'npm test'). Write the test cases to disk with 'write_to_file', verify syntax and interface contracts purely via static inspection, and instruct the user to execute tests locally under Next Steps.\n"
-        "- Formatting Lock: Strictly maintain existing code style, tab indentation, and minimal diffs.\n\n"
+        "- Fast Convergence: Do not perform exploratory search loops. Target files and context are provided.\n"
+        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running test suites (e.g. 'npm test', 'pytest'). Instruct the user to execute tests locally under Next Steps.\n\n"
     )
     parts = [guardrails]
     if context_str:
@@ -455,37 +488,108 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     parts.append(f"## Architectural Task Specification:\n{beautified_prompt}")
     return "".join(parts)
 
-def auto_persist_code_blocks(output_text: str, workspace_dir: str):
+def auto_persist_code_blocks(output_text: str, workspace_dir: str, default_target_files: Optional[List[str]] = None) -> List[str]:
     """
     Safety net: Parses output text for code deliverables that were returned in markdown
     rather than executed via tools, and writes them directly to disk.
     """
     if not output_text or not os.path.exists(workspace_dir):
-        return
+        return []
 
     import re
     from mcp_workspace import normalize_path
 
-    pattern = re.compile(
-        r"(?:^|\n)(?:#{1,6}\s*(?:\d+\.?)?\s*\[?`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?\]?|(?:File:|\*{1,2}File:\*{1,2})\s*`?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`?|\*{1,2}([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)\*{1,2}:?|`([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)`:?).*?\n+```[a-zA-Z0-9_-]*\n(.*?)```",
-        re.DOTALL
-    )
-
     persisted = []
     ws_root = Path(workspace_dir).resolve()
 
-    for match in pattern.finditer(output_text):
-        fname = match.group(1) or match.group(2) or match.group(3) or match.group(4)
-        code = match.group(5)
-        if not fname or not code:
+    BLACKLIST_NAMES = {
+        "node.js", "vue.js", "next.js", "react.js", "express.js",
+        "nest.js", "deno.js", "nuxt.js", "electron.js", "angular.js"
+    }
+    VALID_EXTS = {
+        ".js", ".jsx", ".ts", ".tsx", ".py", ".json", ".yml", ".yaml",
+        ".md", ".sh", ".bash", ".sql", ".html", ".css", ".env", ".example",
+        ".txt", ".cfg", ".ini", ".toml", ".xml", ".dockerfile"
+    }
+
+    # Match each markdown code block
+    code_block_re = re.compile(r"```([a-zA-Z0-9_\-\./]*)\n(.*?)```", re.DOTALL)
+    file_candidate_re = re.compile(
+        r"(?:`|\[)?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_\-]+)(?:`|\])?",
+        re.MULTILINE
+    )
+
+    assigned_targets = list(default_target_files) if default_target_files else []
+    target_idx = 0
+
+    for match in code_block_re.finditer(output_text):
+        lang = match.group(1).strip()
+        code = match.group(2)
+        start_idx = match.start()
+
+        # Skip empty or tiny blocks
+        if not code.strip() or len(code.strip()) < 10:
             continue
 
-        clean_name = fname.strip().replace("file://", "").strip()
-        if "](" in clean_name:
-            clean_name = clean_name.split("](")[0]
-        clean_name = clean_name.strip("`'\"[]()*:")
+        # Look at the text preceding this code block (up to 400 chars)
+        preceding_text = output_text[max(0, start_idx - 400):start_idx]
+        preceding_lines = [l.strip() for l in preceding_text.splitlines() if l.strip()]
 
-        resolved = normalize_path(clean_name)
+        detected_filename = None
+
+        # Check preceding lines in reverse order (closest lines first)
+        for line in reversed(preceding_lines[-5:]):
+            # Skip markdown table rows
+            if line.startswith("|") and line.endswith("|"):
+                continue
+            
+            cands = file_candidate_re.findall(line)
+            valid_cands = []
+            for c in cands:
+                clean_c = c.strip("`'\"[]()*:").replace("file://", "").strip()
+                base_c = os.path.basename(clean_c).lower()
+                ext = os.path.splitext(base_c)[1].lower()
+                if base_c not in BLACKLIST_NAMES and (ext in VALID_EXTS or "env" in base_c):
+                    valid_cands.append(clean_c)
+            
+            if valid_cands:
+                detected_filename = valid_cands[-1]
+                break
+
+        # Check first line of code block for filename comment
+        if not detected_filename:
+            first_line = code.strip().splitlines()[0] if code.strip() else ""
+            if first_line.startswith(("#", "//", "/*", "<!--", "--")):
+                comment_cands = file_candidate_re.findall(first_line)
+                for c in comment_cands:
+                    clean_c = c.strip("`'\"[]()*:").replace("file://", "").strip()
+                    base_c = os.path.basename(clean_c).lower()
+                    ext = os.path.splitext(base_c)[1].lower()
+                    if base_c not in BLACKLIST_NAMES and (ext in VALID_EXTS or "env" in base_c):
+                        detected_filename = clean_c
+                        break
+
+        # Fallback to next known target file
+        if not detected_filename and target_idx < len(assigned_targets):
+            detected_filename = assigned_targets[target_idx]
+            target_idx += 1
+
+        # Fallback to language extension
+        if not detected_filename:
+            if len(code.strip()) > 40 and lang.lower() not in ("bash", "sh", "shell", "console", "cmd", "powershell"):
+                ext_map = {
+                    "python": ".py", "py": ".py", "javascript": ".js", "js": ".js",
+                    "typescript": ".ts", "ts": ".ts", "java": ".java", "sql": ".sql",
+                    "json": ".json", "yaml": ".yml", "yml": ".yml", "html": ".html", "css": ".css"
+                }
+                ext = ext_map.get(lang.lower(), ".py" if "import " in code or "def " in code else None)
+                if ext:
+                    detected_filename = f"generated_module{ext}"
+
+        if not detected_filename:
+            continue
+
+        resolved = normalize_path(detected_filename)
         already_exists = resolved.exists()
 
         if resolved.name == "package.json" and already_exists:
@@ -505,13 +609,17 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str):
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(code, encoding="utf-8")
-            persisted.append(str(resolved.relative_to(ws_root)))
+            rel_name = str(resolved.relative_to(ws_root))
+            if rel_name not in persisted:
+                persisted.append(rel_name)
             print(f"[ROUTER] Auto-persisted deliverable to disk: {resolved}", flush=True)
         except Exception as e:
             print(f"[ROUTER] Failed to auto-persist {resolved}: {e}", flush=True)
 
     if persisted:
         print(f"[ROUTER] Successfully auto-persisted {len(persisted)} deliverables: {', '.join(persisted)}", flush=True)
+
+    return persisted
 
 def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optional[str]:
     """Execute agy CLI non-interactively with active AGY_MODEL, optional persona agent, and workspace cwd."""
@@ -574,15 +682,21 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         )
         output = proc.stdout.strip()
         stderr_lower = proc.stderr.lower() if proc.stderr else ""
-        stdout_lower = output.lower()
 
         if proc.returncode != 0:
             err_msg = (proc.stderr or "").strip() or (proc.stdout or "").strip()
-            print(f"agy exited with code {proc.returncode}: {err_msg}", flush=True)
+            err_lower = err_msg.lower()
+            if any(term in err_lower for term in ["quota exceeded", "rate limit", "resource_exhausted", "too many requests", "429"]):
+                print(f"[ROUTER] agy reported quota/rate limit exceeded: {err_msg}", flush=True)
+            else:
+                print(f"[ROUTER] agy exited with code {proc.returncode}: {err_msg}", flush=True)
             return None
 
-        if "quota exceeded" in stdout_lower or "quota exceeded" in stderr_lower or "rate limit" in stdout_lower:
-            print("agy reported quota or rate limit exceeded", flush=True)
+        # When proc.returncode == 0, output in stdout is the actual model completion.
+        # Check ONLY stderr for actual system/API warnings or quota errors, not stdout,
+        # to avoid false positives when the generated code/text discusses rate limits.
+        if "quota exceeded" in stderr_lower or "resource_exhausted" in stderr_lower or "rate limit exceeded" in stderr_lower:
+            print(f"[ROUTER] agy stderr reported quota/rate limit error: {proc.stderr.strip()}", flush=True)
             return None
 
         if output:
@@ -643,29 +757,6 @@ def completions(req: ChatCompletionRequest):
         except Exception as e:
             return package_response(req.model, f"*[Headroom Proxy Error]*\n\n{e}")
 
-    if agent_id:
-        # Pre-read referenced or auto-discovered workspace files and AST-compress them
-        target_files = discover_relevant_files(clean_prompt or prompt_text)
-        ws_context = read_target_files(target_files) if target_files else ""
-
-        prepared = apply_guardrails(clean_prompt or prompt_text, ws_context)
-        agy_output = execute_agy(prepared, agent_id=agent_id)
-        if agy_output is not None:
-            from ast_compressor import get_stats
-            s = get_stats()
-            saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
-            badge = f"*[Agent Task: {agent_id.capitalize()} ({AGY_MODEL}){saved_str}]*\n\n"
-            return package_response(req.model, badge + agy_output)
-
-        # Automatic fallback to local Ollama on failure/timeout
-        fallback_out = call_ollama_generation(clean_prompt or prompt_text)
-        if fallback_out:
-            try:
-                auto_persist_code_blocks(fallback_out, WORKSPACE_DIR)
-            except Exception as e:
-                print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
-        return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
-
     # 2. Multimodal / Vision Bypass
     if has_image:
         if gemini_client and parts:
@@ -683,37 +774,34 @@ def completions(req: ChatCompletionRequest):
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
         return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + gen_out)
 
-    # 3. Local Prompt Beautification & Target Extraction (Ollama)
-    structured_schema = {
-        "type": "object",
-        "properties": {
-            "is_complex_agent": {
-                "type": "boolean",
-                "description": "True if prompt involves multi-file refactoring, broad codebase edits, or agent-level actions. False for standard single functions, questions, or algorithms."
-            },
-            "beautified_prompt": {
-                "type": "string",
-                "description": "Clean, concise, and structured architectural engineering specification converted from informal or messy user prompt."
-            },
-            "target_files": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Specific file paths in the workspace to inspect or modify."
-            }
-        },
-        "required": ["is_complex_agent", "beautified_prompt"]
-    }
-
-    meta = {"is_complex_agent": False, "beautified_prompt": prompt_text, "target_files": []}
+    # 3. Unified Inbound Pipeline: Ollama Context Synthesizer (0 Cloud Tokens)
+    # Extracts the essential technical brief and target files so agy is only invoked with necessary info
+    synthesized_prompt = clean_prompt or prompt_text
+    target_files = []
     try:
+        structured_schema = {
+            "type": "object",
+            "properties": {
+                "beautified_prompt": {
+                    "type": "string",
+                    "description": "Clean, concise, and structured technical specification converted from user prompt, with all conversational noise stripped."
+                },
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific file paths in the workspace directly implicated by the task."
+                }
+            },
+            "required": ["beautified_prompt"]
+        }
         ollama_res = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": (
-                    "You are a technical requirements synthesizer. Convert this user request into a precise, structured architectural specification. "
-                    "Eliminate conversational chatter, slang, and ambiguity. Identify whether it requires multi-step autonomous execution, "
-                    f"and list any directly referenced target file paths:\n\n{prompt_text}"
+                    "You are a technical requirements synthesizer. Convert this user request into a precise, structured technical specification. "
+                    "Eliminate conversational chatter, pleasantries, and ambiguity. Extract any directly referenced or target file paths:\n\n"
+                    f"{clean_prompt or prompt_text}"
                 ),
                 "format": structured_schema,
                 "stream": False
@@ -724,58 +812,36 @@ def completions(req: ChatCompletionRequest):
             resp_json = ollama_res.json()
             raw_meta = json.loads(resp_json.get("response", "{}"))
             if isinstance(raw_meta, dict):
-                meta.update(raw_meta)
+                synthesized_prompt = raw_meta.get("beautified_prompt") or synthesized_prompt
+                target_files = raw_meta.get("target_files", [])
+                print(f"[ROUTER] Ollama synthesized specification ({len(synthesized_prompt)} chars), target files: {target_files}", flush=True)
     except Exception as e:
-        print(f"Ollama beautification fallback: {e}")
+        print(f"[ROUTER] Ollama synthesis notice: {e}", flush=True)
 
-    is_complex = meta.get("is_complex_agent", False)
-    beautified = meta.get("beautified_prompt") or prompt_text
-    target_files = meta.get("target_files", [])
+    # 4. AST Workspace Pre-Reader (Compresses workspace files at 0 cloud tokens)
+    if not target_files:
+        target_files = discover_relevant_files(synthesized_prompt)
+    ws_context = read_target_files(target_files) if target_files else ""
 
-    # 4. Complex Agent Pipeline: Pre-Reader -> Headroom Compress -> Guardrails -> agy Dispatch
-    if is_complex:
-        # Discover and pre-read matching files from workspace
-        if not target_files:
-            target_files = discover_relevant_files(beautified)
-        context_str = read_target_files(target_files)
-        # Apply anti-hallucination & quota safeguards
-        guarded_prompt = apply_guardrails(beautified, context_str)
+    # 5. Dispatch to agy (Gemini Orchestrator) with Division of Labor Guardrails
+    guarded_prompt = apply_guardrails(synthesized_prompt, ws_context)
+    selected_agent = agent_id or "coder"
+    agy_output = execute_agy(guarded_prompt, agent_id=selected_agent)
+    if agy_output is not None:
+        from ast_compressor import get_stats
+        s = get_stats()
+        saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
+        badge = f"*[Agent Task: {selected_agent.capitalize()} ({AGY_MODEL}){saved_str}]*\n\n"
+        return package_response(req.model, badge + agy_output)
 
-        agy_output = execute_agy(guarded_prompt, agent_id="coder")
-        if agy_output is not None:
-            from ast_compressor import get_stats
-            s = get_stats()
-            saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
-            out = f"*[Agent Task: Coder ({AGY_MODEL}){saved_str}]*\n\n" + agy_output
-            return package_response(req.model, out)
-
-        # Automatic fallback: if agy exits non-zero or exceeds quota, fallback to Ollama
-        target = f"Fallback Local Ollama ({OLLAMA_MODEL})"
-        print(f"[ROUTER] Target: {target}", flush=True)
-        fallback_out = call_ollama_generation(beautified)
-        if fallback_out:
-            try:
-                auto_persist_code_blocks(fallback_out, WORKSPACE_DIR)
-            except Exception as e:
-                print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
-        return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + fallback_out)
-
-    # 5. Simple Task: Use Gemini 2.5 Flash if client available, otherwise route to local Ollama
-    if gemini_client:
-        target = "Gemini 2.5 Flash"
-        print(f"[ROUTER] Target: {target}", flush=True)
+    # 6. Automatic Fallback to Local Ollama with Direct Workspace Disk Persistence
+    print(f"[ROUTER] agy failed or quota exhausted; invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
+    fallback_out = call_ollama_generation(synthesized_prompt)
+    saved_files = []
+    if fallback_out:
         try:
-            res = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=beautified
-            )
-            out = "*[Simple Task: Gemini 2.5 Flash]*\n\n" + (res.text or "")
-            return package_response(req.model, out)
+            saved_files = auto_persist_code_blocks(fallback_out, WORKSPACE_DIR, default_target_files=target_files)
         except Exception as e:
-            print(f"Gemini simple generation error: {e}")
-
-    # Fallback / Default local Ollama
-    target = f"Local Ollama ({OLLAMA_MODEL})"
-    print(f"[ROUTER] Target: {target}", flush=True)
-    ollama_out = call_ollama_generation(beautified)
-    return package_response(req.model, "*[Simple Task: Local Ollama]*\n\n" + ollama_out)
+            print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
+    saved_badge = f"\n\n*[Files saved to workspace: {', '.join(saved_files)}]*" if saved_files else ""
+    return package_response(req.model, "*[Fallback: Local Ollama]*" + saved_badge + "\n\n" + fallback_out)

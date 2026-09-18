@@ -5,7 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY tests/ ./tests/
-RUN chmod +x /app/src/mcp_workspace.py
+RUN chmod +x /app/src/mcp_workspace.py && ln -sf /app/src/mcp_workspace.py /app/mcp_workspace.py
 RUN mkdir -p /home/appuser/.gemini /workspace && chown -R 1000:1000 /home/appuser /workspace /app
 ENV HOME=/home/appuser
 ENV PYTHONPATH=/app/src

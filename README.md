@@ -11,13 +11,14 @@ Incoming requests to the OpenAI-compatible gateway are analyzed, distilled via l
 ```
 User Prompt (Open WebUI / API)
            │
-           ├── [Natural Language or Persona Mention: @coder, @reviewer, @architect]
+           ├── [Natural Language or Persona Mention: @coder, @reviewer, @architect, @tester]
            │
            ▼
-[ Router: Auto-Discovery & Pre-Read ]
+[ Router: Inbound Synthesis & Auto-Discovery ]
     - User named specific files? Use those.
-    - Natural language request ("Add health check")?
-      Local Ollama (0 Cloud Tokens) inspects /workspace file tree and auto-selects target files.
+    - Natural language request or conversational prompt?
+      Local Ollama (0 Cloud Tokens) strips conversational chatter, extracts key intent,
+      inspects /workspace file tree, and auto-selects target files.
            │
            ▼
 [ AST Code & Log Compression Engine ]
@@ -27,18 +28,20 @@ User Prompt (Open WebUI / API)
     - Pre-injects compressed code into "## Workspace Pre-Read Context"
            │
            ▼
-[ Antigravity (agy) Execution with Headless MCP ]
+[ Antigravity (agy) Orchestration with Headless MCP ]
     - Subprocess agy --model <AGY_MODEL> --mode accept-edits --dangerously-skip-permissions
     - Receives compressed code upfront (no blind disk searches needed)
-    - Equipped with zero-cost in-flight MCP tools:
-        • trace_symbol: Multi-language (Java, Python, TypeScript) symbol, Spring bean, and call-site tracer
-        • ask_local_assistant: Workspace-grounded code retrieval and drafting via local Ollama (0 cloud tokens)
-        • run_command: Sandboxed shell runner with programmatic test execution interceptors
+    - Division of Labor (Zero Cloud Token Economy):
+        • Heavy Code / Large Files: agy invokes ask_local_assistant(query=..., target_file=...)
+          -> Local Ollama (qwen2.5-coder:1.5b) generates and writes complete file directly to disk (0 cloud tokens)
+        • Minimal Tweaks (< 5% tokens): Direct write_to_file / replace_file_content by agy
+        • In-Flight Zero-Cost Tools: trace_symbol, ask_local_assistant, run_command, delete_file
            │
            ▼
-[ Execution or Local Fallback ]
-    - Exit 0: Emits clean OpenAI response envelope with token savings badge
-    - Non-zero / Timeout / 429 Quota: Automatic fallback to local Ollama
+[ Execution, Auto-Persistence or Local Fallback ]
+    - Exit 0: Code persisted on disk, emits clean OpenAI response envelope with token savings badge
+    - Smart Auto-Persist: Router verifies and auto-persists generated code blocks to disk
+    - Non-zero / Timeout / 429 Quota: Automatic fallback to local Ollama with direct disk persistence
 ```
 
 ### Flowchart
@@ -50,24 +53,26 @@ flowchart TD
     Router --> CheckHeadroom{"Headroom Proxy Model?"}
     CheckHeadroom -->|Yes| HeadroomDirect["Direct Pass-Through<br>Headroom Proxy :8787"]
 
-    CheckHeadroom -->|No| CheckPersona{"Persona Trigger?<br>@coder / @reviewer / @architect"}
+    CheckHeadroom -->|No| CheckPersona{"Persona Trigger?<br>@coder / @reviewer / @architect / @tester"}
     
-    CheckPersona -->|Yes| AutoDiscover["1. Workspace Auto-Discovery<br>• User files or Local Ollama scan<br>• Identifies relevant target files"]
+    CheckPersona -->|Yes| InboundSynth["1. Ollama Inbound Synthesis & Discovery<br>• Strips conversational noise & chatter<br>• Discovers target files from /workspace (0 tokens)"]
     CheckPersona -->|No| CheckVision{"Multimodal / Image?"}
 
     CheckVision -->|Yes| GeminiVision["Gemini 2.5 Flash / Vision Fallback"]
-    CheckVision -->|No| AutoDiscover
+    CheckVision -->|No| InboundSynth
 
-    AutoDiscover --> ASTCompress["2. AST & Log Compression Engine<br>• Strip comments, docstrings & whitespace<br>• Filter framework log stacktraces<br>• Save 30% - 55% input tokens"]
+    InboundSynth --> ASTCompress["2. AST & Log Compression Engine<br>• Strip comments, docstrings & whitespace<br>• Filter framework log stacktraces<br>• Save 30% - 55% input tokens"]
 
     ASTCompress --> PreRead["3. Inject Pre-Read Context<br>## Workspace Pre-Read Context"]
 
-    PreRead --> DispatchAgy["4. Dispatch agy with MCP Tools<br>• write_to_file / delete_file / run_command<br>• trace_symbol (AST call tracer)<br>• ask_local_assistant (Local Ollama)"]
+    PreRead --> DispatchAgy["4. Dispatch agy with Headless MCP Tools<br>• ask_local_assistant (target_file write @ 0 cloud tokens)<br>• write_to_file / replace_file_content (< 5% diffs)<br>• trace_symbol (AST call tracer)<br>• run_command (test execution blocker)"]
 
     DispatchAgy --> CheckStatus{"agy Result Code"}
 
-    CheckStatus -->|Exit 0| AgentSuccess["*[Agent Task: Antigravity | AST Tokens Saved: X (Y%)]*"]
-    CheckStatus -->|Non-Zero / Quota / Timeout| FallbackOllama["*[Fallback: Local Ollama]*<br>Local Model Code Gen"]
+    CheckStatus -->|Exit 0| AutoPersist["5. Smart Auto-Persistence<br>Verify files written to /workspace"]
+    CheckStatus -->|Non-Zero / Quota / Timeout| FallbackOllama["*[Fallback: Local Ollama]*<br>Local Model Code Gen & Disk Write"]
+
+    AutoPersist --> AgentSuccess["*[Agent Task: Antigravity | AST Tokens Saved: X (Y%)]*"]
 
     GeminiVision --> Envelope["OpenAI-Compatible Response Envelope"]
     HeadroomDirect --> Envelope
@@ -101,9 +106,9 @@ services/router/
 ├── requirements.txt
 ├── src/
 │   ├── __init__.py
-│   ├── app.py                   # FastAPI Gateway & Quota Router
+│   ├── app.py                   # FastAPI Gateway, Persona Sync, Inbound Synthesizer & Router
 │   ├── ast_compressor.py        # Multi-Format AST Code & Log Compressor
-│   └── mcp_workspace.py         # Headless Zero-Cost MCP Tool Server
+│   └── mcp_workspace.py         # Headless Zero-Cost MCP Tool Server (with Ollama disk writer)
 └── tests/
     ├── __init__.py
     ├── test_ast_compressor.py   # AST Compression Unit Tests (15 tests)
@@ -114,18 +119,20 @@ services/router/
 
 ## Multi-Agent Personas
 
-The stack natively supports specialized personas declared in `.antigravity/agents/`:
+The stack natively supports specialized personas declared in `.antigravity/agents/` (automatically synchronized to the container's agent registry on boot):
 
-| Persona | Triggers | Description |
-| :--- | :--- | :--- |
-| **`coder`** | `@coder`, `/coder`, `@dev`, `@implement` | Senior Software Engineer: minimal-diff implementation, bug fixes, and unit tests strictly within `/workspace`. |
-| **`reviewer`** | `@reviewer`, `/reviewer`, `@audit` | Senior Security & Quality Auditor: inspects code for vulnerabilities, edge-case bugs, missing error branches, and suggests minimal patches. |
-| **`architect`** | `@architect`, `/architect` | System Architect: pre-implementation blueprints, interface contracts, and phased technical roadmaps. |
+| Persona | Triggers | Description | Zero Cloud Token Division of Labor |
+| :--- | :--- | :--- | :--- |
+| **`coder`** | `@coder`, `/coder`, `@dev`, `@implement` | Senior Software Engineer: minimal-diff implementation, bug fixes, and unit tests strictly within `/workspace`. | Calls `ask_local_assistant` with `target_file` for complete files/implementations (0 cloud tokens). Direct cloud edits reserved for < 5% minimal diffs. |
+| **`reviewer`** | `@reviewer`, `/reviewer`, `@audit` | Senior Security & Quality Auditor: inspects code for vulnerabilities, edge-case bugs, missing error branches, and suggests minimal patches. | Calls `ask_local_assistant` with `target_file` to draft full audit reports and reproduction scripts. Cloud output limited to concise summaries (< 5% tokens). |
+| **`architect`** | `@architect`, `/architect` | System Architect: pre-implementation blueprints, interface contracts, and phased technical roadmaps. | Calls `ask_local_assistant` with `target_file` for comprehensive schemas, OpenAPI specs, and data models. Cloud output limited to high-level diagrams and roadmaps. |
+| **`tester`** | `@tester`, `/tester`, `@test`, `@verify` | Test Engineer & Verification Specialist: zero-noise surgical test execution, fail-fast runs, and regression isolation. | Calls `ask_local_assistant` with `target_file` to generate extensive test suites and mock fixtures. Executes surgical quiet test commands with fail-fast flags. |
 
 ### Global Directives (`AGENTS.md`)
 The project root includes [AGENTS.md](AGENTS.md) enforcing:
 - Operational scope restricted exclusively to `/workspace`.
 - **Pre-Read Context as Source of Truth**: Treats `Workspace Pre-Read Context` as compressed truth to avoid repetitive disk `view_file` calls.
+- **Division of Labor via Local Ollama**: Mandatory delegation of multi-line code generation to `ask_local_assistant` with `target_file` at 0 cloud tokens.
 - **Zero-Cost Tool Utilization**: Prioritizes `trace_symbol` and `ask_local_assistant` for call graph tracing and codebase lookups.
 - **Fast Convergence & Safe Deletion**: Consolidates multi-file edits and batch deletions into single-turn operations to avoid latency overhead.
 - Non-destructive, minimal-diff editing practices.
@@ -134,7 +141,7 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
 
 ## Key Features
 
-- **Upfront Workspace Auto-Discovery**: Prompt in plain English (e.g. `@coder Add user authentication`) without manually listing file paths. Local Ollama automatically detects the target files from `/workspace` file tree at **0 cloud tokens**.
+- **Upfront Inbound Synthesis & Auto-Discovery**: Conversational requests (e.g. `@coder Add user authentication`) are synthesized by local Ollama to strip chit-chat and detect target files from the `/workspace` tree at **0 cloud tokens**.
 - **Multi-Format Code & Log Compression Engine (`ast_compressor.py`)**: Automatically minifies target context across multiple languages and data formats before passing context to `agy`, slashing token consumption by **30% to 55%**:
   - **Python (`.py`)**: AST-based docstring, comment, and whitespace minification.
   - **JS / TS / C / C++ / Java / Go / Rust / C# / PHP (`.js`, `.ts`, `.jsx`, `.tsx`, `.c`, `.cpp`, `.go`, `.rs`, `.java`, `.cs`, `.php`, `.vue`, `.svelte`)**: String-aware comment stripping (`//`, `/* */`), brace/semicolon/comma line collapsing, and blank line elimination.
@@ -148,12 +155,14 @@ The project root includes [AGENTS.md](AGENTS.md) enforcing:
   - **Tabular Data (`.csv`, `.tsv`)**: Compacts whitespace and auto-truncates large datasets to representative schema samples.
   - **Markdown (`.md`, `.mdx`, `.txt`)**: Comment removal and excessive blank line compaction.
 - **In-Flight Zero-Cost MCP Tools (`mcp_workspace.py`)**:
-  - `write_to_file`: Headless file creations and non-destructive edits.
+  - `ask_local_assistant`: Query local Ollama (`qwen2.5-coder:1.5b`) grounded with automated workspace snippet retrieval. Includes **`target_file`** parameter to generate complete files directly to `/workspace` at **0 cloud tokens** (uncapped 4096-token generation, returning a 1-line confirmation to agy).
+  - `write_to_file` & `replace_file_content`: Headless file creations and non-destructive surgical edits for minimal tweaks (< 5% tokens).
   - `run_command`: Sandboxed command runner with hard programmatic interceptors blocking test executions across Java (`mvn`, `gradle`), JS/TS (`jest`, `vitest`, `mocha`, `playwright`, `cypress`), Python (`pytest`, `unittest`), Go, Rust, and .NET.
   - `trace_symbol`: Fast multi-language symbol tracer supporting Java (classes, interfaces, Spring beans, methods), Python (AST), and TypeScript.
-  - `ask_local_assistant`: Query local Ollama (`qwen2.5-coder:1.5b`) grounded with automated workspace snippet retrieval for signatures, mock patterns, and code/boilerplate drafting (0 cloud tokens).
   - `delete_file`: Safe single or batch deletion of obsolete files/directories within `/workspace`.
-- **Fast Convergence**: Enforces multi-file batching so agent actions complete within 2 turns rather than serial multi-minute round trips.
+- **Smart Auto-Persistence**: Post-processes agent responses to ensure any code blocks intended for files are validated and persisted to `/workspace` (with language label filtering e.g. ignoring `Node.js` headings).
+- **Automated MCP Server Discovery**: Router container symlinks `/app/mcp_workspace.py` and registers `workspace_tools` via `agy mcp add` on startup, ensuring `agy` always has native access to workspace filesystem tools.
+- **Fast Convergence**: Enforces multi-file batching so agent actions complete within 1–2 turns rather than serial multi-minute round trips.
 - **Real-Time Telemetry (`/stats`)**: Query `http://localhost:8088/stats` for live cumulative statistics on AST tokens saved, requests processed, and Headroom proxy cache metrics.
 
 ---
@@ -210,6 +219,9 @@ docker compose run --rm -v "${PWD}/services/router:/app" -e PYTHONPATH=/app/src 
    ```bash
    docker compose up -d --build
    ```
+
+   > [!TIP]
+   > **Windows WSL2 Users**: Always run Docker Compose commands (`docker compose up -d --build`) from inside your **WSL Linux terminal** (e.g. `Ubuntu`). This ensures environment variables like `HOST_HOME=${HOME}` map properly to your Linux user home directory (`/home/<user>`) where `.local/bin/agy`, `.gemini`, and `.config` are located.
 
 4. **Verify health & stats connectivity:**
    ```bash

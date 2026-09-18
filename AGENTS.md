@@ -20,6 +20,7 @@
 ## 4. Token Economy & Local Tool Utilization
 - **Pre-Read Context**: When `Workspace Pre-Read Context` is present, treat it as the compressed source of truth; avoid redundant `view_file` calls on the same files.
 - **Local Helper Tools**: Prefer `trace_symbol` and `ask_local_assistant` MCP tools for call-graph tracing and codebase inquiries to preserve token budget.
+- **Heavy Code Generation via Local Ollama**: For new files or extensive multi-line implementations, invoke `ask_local_assistant(query="...", target_file="...")` to generate and persist files directly to disk at 0 cloud tokens. Reserve direct cloud edits for minimal tweaks (< 5% token impact).
 
 ## Code Style & Formatting Preservation Rules
 
