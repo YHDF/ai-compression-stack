@@ -41,6 +41,17 @@ def handle_replace_file_content(args: dict) -> dict:
     if not target_path or target_content is None:
         return {"content": [{"type": "text", "text": "Error: missing 'path' or 'TargetContent'"}], "isError": True}
 
+    # Hard Quota Guardrail: Prevent cloud agent from dumping massive code diffs
+    rep_lines = len(replacement_content.strip().splitlines())
+    if rep_lines > 30:
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Quota Guardrail Violation: Cloud diff of {rep_lines} lines exceeds the 30-line limit to protect upstream token quota. You MUST invoke 'ask_local_assistant(query=\"...\", target_file=\"{target_path}\")' to have local Ollama generate and save the file directly to disk at 0 cloud cost."
+            }],
+            "isError": True
+        }
+
     resolved = normalize_path(target_path)
     if not resolved.exists():
         return {"content": [{"type": "text", "text": f"Error: file not found at {resolved}"}], "isError": True}
@@ -64,6 +75,17 @@ def handle_write_to_file(args: dict) -> dict:
     
     if not target_path:
         return {"content": [{"type": "text", "text": "Error: missing required 'path' parameter"}], "isError": True}
+
+    # Hard Quota Guardrail: Prevent cloud agent from writing entire files via cloud tokens
+    content_lines = len(content.strip().splitlines())
+    if content_lines > 30:
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Quota Guardrail Violation: Direct cloud file write of {content_lines} lines exceeds the 30-line limit to protect upstream token quota. You MUST invoke 'ask_local_assistant(query=\"...\", target_file=\"{target_path}\")' to have local Ollama generate and write this file directly to disk at 0 cloud cost."
+            }],
+            "isError": True
+        }
     
     resolved = normalize_path(target_path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
