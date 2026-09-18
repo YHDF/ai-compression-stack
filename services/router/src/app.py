@@ -6,10 +6,12 @@ import base64
 import shutil
 import subprocess
 import requests
+import queue
+import threading
 from typing import List, Union, Dict, Any, Optional
 from pathlib import Path
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Local AI Context-Router & Compression Stack")
@@ -138,6 +140,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "auto-router"
     messages: List[ChatMessage]
+    stream: Optional[bool] = False
 
 def package_response(model_name: str, content: str):
     return {
@@ -476,11 +479,11 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     guardrails = (
         "## Operational Boundaries & Guardrails (STRICT ZERO-CLOUD-TOKEN PROTOCOL):\n"
         "- MANDATORY LOCAL DELEGATION (CRITICAL): You are strictly FORBIDDEN from generating multi-line code, tests, or implementations in your cloud output, and FORBIDDEN from calling 'view_file' to browse the repository.\n"
-        "- All relevant code is already provided below in 'Workspace Pre-Read Context'.\n"
+        "- All relevant code is already provided below in 'Workspace Pre-Read Context'. Prefer 'trace_symbol' and 'ask_local_assistant' for call-graph inquiries.\n"
         "- To create or update files, you MUST invoke 'ask_local_assistant(query=\"...\", target_file=\"path/to/file.ext\")'. Local Ollama will generate and write the code directly to disk at ZERO cloud tokens.\n"
         "- Direct edits without Ollama are strictly prohibited unless it is a 1-2 line trivial fix via 'replace_file_content'.\n"
-        "- FAST CONVERGENCE: Complete your entire task in 1 single turn. Do NOT engage in multi-turn exploratory loops.\n"
-        "- ABSOLUTE TEST PROHIBITION: NEVER run test suites ('npm test', 'pytest', etc.). Instruct the user to execute tests locally under Next Steps.\n\n"
+        "- FAST CONVERGENCE & Zero Search Loops: Complete your entire task in 1 single turn. Do NOT engage in multi-turn exploratory loops.\n"
+        "- Absolute Test Prohibition: NEVER run test suites ('npm test', 'pytest', etc.). Instruct the user to execute tests locally under Next Steps.\n\n"
     )
     parts = [guardrails]
     if context_str:
@@ -547,6 +550,8 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str, default_targe
             valid_cands = []
             for c in cands:
                 clean_c = c.strip("`'\"[]()*:").replace("file://", "").strip()
+                if clean_c.startswith("a/") or clean_c.startswith("b/") or clean_c.startswith("a\\") or clean_c.startswith("b\\"):
+                    continue
                 base_c = os.path.basename(clean_c).lower()
                 ext = os.path.splitext(base_c)[1].lower()
                 if base_c not in BLACKLIST_NAMES and (ext in VALID_EXTS or "env" in base_c):
@@ -699,7 +704,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
             print(f"[ROUTER] agy stderr reported quota/rate limit error: {proc.stderr.strip()}", flush=True)
             return None
 
-        if output:
+        if output and agent_id == "coder":
             try:
                 auto_persist_code_blocks(output, cwd)
             except Exception as e:
@@ -713,11 +718,10 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         print(f"agy subprocess execution error: {e}", flush=True)
         return None
 
-@app.post("/v1/chat/completions")
-def completions(req: ChatCompletionRequest):
+def process_chat_request(req: ChatCompletionRequest) -> str:
     last_msg = next((m for m in reversed(req.messages) if m.role == "user"), None)
     if not last_msg:
-        return package_response(req.model, "No prompt received.")
+        return "No prompt received."
 
     prompt_text, parts, has_image = parse_parts(last_msg.content)
 
@@ -752,10 +756,13 @@ def completions(req: ChatCompletionRequest):
             headroom_req = req.model_dump()
             headroom_res = requests.post(f"{HEADROOM_PROXY}/v1/chat/completions", json=headroom_req, timeout=AGY_TIMEOUT)
             if headroom_res.status_code == 200:
-                return headroom_res.json()
-            return JSONResponse(status_code=headroom_res.status_code, content=headroom_res.json())
+                resp_json = headroom_res.json()
+                if isinstance(resp_json, dict) and "choices" in resp_json and len(resp_json["choices"]) > 0:
+                    return resp_json["choices"][0].get("message", {}).get("content", "")
+                return json.dumps(resp_json)
+            return f"*[Headroom Proxy Error: HTTP {headroom_res.status_code}]*"
         except Exception as e:
-            return package_response(req.model, f"*[Headroom Proxy Error]*\n\n{e}")
+            return f"*[Headroom Proxy Error]*\n\n{e}"
 
     # 2. Multimodal / Vision Bypass
     if has_image:
@@ -764,15 +771,14 @@ def completions(req: ChatCompletionRequest):
             print(f"[ROUTER] Target: {target}", flush=True)
             try:
                 res = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=parts)
-                out = "*[Vision Routed: Gemini 2.5 Flash]*\n\n" + (res.text or "")
-                return package_response(req.model, out)
+                return "*[Vision Routed: Gemini 2.5 Flash]*\n\n" + (res.text or "")
             except Exception as e:
                 print(f"Gemini vision request failed: {e}")
         # Fallback to local Ollama if no Gemini key or request failed
         target = f"Local Ollama (Vision Fallback: {OLLAMA_MODEL})"
         print(f"[ROUTER] Target: {target}", flush=True)
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
-        return package_response(req.model, "*[Fallback: Local Ollama]*\n\n" + gen_out)
+        return "*[Fallback: Local Ollama]*\n\n" + gen_out
 
     # 3. Unified Inbound Pipeline: Ollama Context Synthesizer (0 Cloud Tokens)
     # Extracts the essential technical brief and target files so agy is only invoked with necessary info
@@ -842,7 +848,7 @@ def completions(req: ChatCompletionRequest):
         s = get_stats()
         saved_str = f" | AST Tokens Saved: {s.get('tokens_saved', 0)} ({s.get('savings_percentage', 0)}%)" if s.get('total_requests', 0) > 0 else ""
         badge = f"*[Agent Task: {selected_agent.capitalize()} ({AGY_MODEL}){saved_str}]*\n\n"
-        return package_response(req.model, badge + agy_output)
+        return badge + agy_output
 
     # 6. Automatic Fallback to Local Ollama with Direct Workspace Disk Persistence
     print(f"[ROUTER] agy failed or quota exhausted; invoking Ollama fallback (model={OLLAMA_MODEL})", flush=True)
@@ -854,4 +860,105 @@ def completions(req: ChatCompletionRequest):
         except Exception as e:
             print(f"[ROUTER] Notice in auto_persist_code_blocks (fallback): {e}", flush=True)
     saved_badge = f"\n\n*[Files saved to workspace: {', '.join(saved_files)}]*" if saved_files else ""
-    return package_response(req.model, "*[Fallback: Local Ollama]*" + saved_badge + "\n\n" + fallback_out)
+    return "*[Fallback: Local Ollama]*" + saved_badge + "\n\n" + fallback_out
+
+def generate_stream_response(req: ChatCompletionRequest):
+    """Format response as live SSE stream with periodic keep-alive pings to prevent client timeout."""
+    def event_stream():
+        chunk_id = f"chatcmpl-{int(time.time())}"
+        created_ts = int(time.time())
+
+        # 1. Immediately yield initial chunk with role so client detects stream start
+        role_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(role_chunk)}\n\n"
+
+        # 2. Worker thread runs pipeline asynchronously
+        res_q = queue.Queue()
+
+        def worker():
+            try:
+                out = process_chat_request(req)
+                res_q.put(("ok", out))
+            except Exception as e:
+                res_q.put(("err", str(e)))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        content = None
+        while t.is_alive():
+            try:
+                status, payload = res_q.get(timeout=2.0)
+                content = payload if status == "ok" else f"*[Pipeline Error]*\n\n{payload}"
+                break
+            except queue.Empty:
+                # SSE comment keeps TCP connection alive through client/proxy timeouts
+                yield ": keep-alive\n\n"
+
+        if content is None:
+            try:
+                status, payload = res_q.get(timeout=2.0)
+                content = payload if status == "ok" else f"*[Pipeline Error]*\n\n{payload}"
+            except queue.Empty:
+                content = "*[Router Notice: Processing finished with no output]*"
+
+        # 3. Stream content progressively in lines
+        lines = content.splitlines(keepends=True)
+        if not lines:
+            lines = [content]
+
+        for line in lines:
+            c_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": line},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(c_chunk)}\n\n"
+
+        # 4. Stop chunk
+        stop_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(stop_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/v1/chat/completions")
+def completions(req: ChatCompletionRequest):
+    if req.stream:
+        return generate_stream_response(req)
+    content = process_chat_request(req)
+    return package_response(req.model, content)
