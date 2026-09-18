@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import base64
@@ -473,14 +474,13 @@ def discover_relevant_files(prompt: str) -> List[str]:
 def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
     """Enforce architectural boundaries on agy to prevent multi-turn search loops and preserve token quota."""
     guardrails = (
-        "## Operational Boundaries & Guardrails:\n"
-        "- MANDATORY DISK WRITE VIA TOOLS (CRITICAL): You are equipped with direct workspace tools ('write_to_file', 'replace_file_content', 'delete_file', 'ask_local_assistant', 'trace_symbol'). All files must be persisted directly to disk in /workspace. Merely returning code blocks in markdown without persisting to disk is strictly forbidden.\n"
-        "- DIVISION OF LABOR (CRITICAL TO PRESERVE CLOUD QUOTA):\n"
-        "  1. Heavy Implementation & New Files: You MUST call 'ask_local_assistant(query=\"...\", target_file=\"path/to/file.ext\")' to have local Ollama generate and save the code directly to disk at ZERO cloud tokens. The tool will save the file to disk and return a confirmation. Do NOT generate hundreds of lines of code in your cloud output.\n"
-        "  2. Minimal Edits (< 5% Token Impact): Only if a change is very minimal (e.g. 1-5 line bug fix, small diff, or config tweak), you are authorized to use 'replace_file_content' or 'write_to_file' directly without Ollama.\n"
-        "- Scope: Modify strictly the files required to fulfill the specification.\n"
-        "- Fast Convergence: Do not perform exploratory search loops. Target files and context are provided.\n"
-        "- Absolute Test Prohibition: NEVER run tests. You are strictly PROHIBITED from running test suites (e.g. 'npm test', 'pytest'). Instruct the user to execute tests locally under Next Steps.\n\n"
+        "## Operational Boundaries & Guardrails (STRICT ZERO-CLOUD-TOKEN PROTOCOL):\n"
+        "- MANDATORY LOCAL DELEGATION (CRITICAL): You are strictly FORBIDDEN from generating multi-line code, tests, or implementations in your cloud output, and FORBIDDEN from calling 'view_file' to browse the repository.\n"
+        "- All relevant code is already provided below in 'Workspace Pre-Read Context'.\n"
+        "- To create or update files, you MUST invoke 'ask_local_assistant(query=\"...\", target_file=\"path/to/file.ext\")'. Local Ollama will generate and write the code directly to disk at ZERO cloud tokens.\n"
+        "- Direct edits without Ollama are strictly prohibited unless it is a 1-2 line trivial fix via 'replace_file_content'.\n"
+        "- FAST CONVERGENCE: Complete your entire task in 1 single turn. Do NOT engage in multi-turn exploratory loops.\n"
+        "- ABSOLUTE TEST PROHIBITION: NEVER run test suites ('npm test', 'pytest', etc.). Instruct the user to execute tests locally under Next Steps.\n\n"
     )
     parts = [guardrails]
     if context_str:
@@ -819,9 +819,19 @@ def completions(req: ChatCompletionRequest):
         print(f"[ROUTER] Ollama synthesis notice: {e}", flush=True)
 
     # 4. AST Workspace Pre-Reader (Compresses workspace files at 0 cloud tokens)
-    if not target_files:
-        target_files = discover_relevant_files(synthesized_prompt)
-    ws_context = read_target_files(target_files) if target_files else ""
+    real_targets = []
+    ws_root = Path(WORKSPACE_DIR).resolve()
+    for tf in target_files:
+        clean_tf = tf.strip().lstrip("/")
+        full_p = (ws_root / clean_tf).resolve()
+        if full_p.exists() and full_p.is_file():
+            real_targets.append(clean_tf)
+
+    if not real_targets:
+        real_targets = discover_relevant_files(synthesized_prompt)
+
+    print(f"[ROUTER] Validated target files for AST pre-read: {real_targets}", flush=True)
+    ws_context = read_target_files(real_targets) if real_targets else ""
 
     # 5. Dispatch to agy (Gemini Orchestrator) with Division of Labor Guardrails
     guarded_prompt = apply_guardrails(synthesized_prompt, ws_context)
