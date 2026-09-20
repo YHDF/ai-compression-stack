@@ -32,13 +32,17 @@ class TestMCPWorkspace(unittest.TestCase):
         self.test_workspace.mkdir(parents=True, exist_ok=True)
         os.environ["WORKSPACE_DIR"] = str(self.test_workspace)
         import mcp_workspace
+        import app
         mcp_workspace._local_assistant_status["failures"] = 0
         mcp_workspace._local_assistant_status["last_error"] = None
         self.patcher = patch.object(mcp_workspace, 'WORKSPACE_ROOT', str(self.test_workspace.resolve()))
         self.patcher.start()
+        self.app_patcher = patch.object(app, 'WORKSPACE_DIR', str(self.test_workspace.resolve()))
+        self.app_patcher.start()
 
     def tearDown(self):
         self.patcher.stop()
+        self.app_patcher.stop()
         # Cleanup temporary files
         if self.test_workspace.exists():
             import shutil
@@ -164,15 +168,16 @@ class TestMCPWorkspace(unittest.TestCase):
         self.assertIn("run_command", tool_names)
         self.assertIn("write_to_file", tool_names)
 
-    def test_apply_guardrails_mandates_local_ollama(self):
+    def test_apply_guardrails_tech_lead_protocol(self):
         prompt = "Add JWT token validation to AuthManager"
         guarded = apply_guardrails(prompt, "## Workspace Pre-Read Context:\nFile: auth.py")
         
-        # Verify mandatory local inquiries & zero search loops are enforced
+        # Verify Tech Lead directives, tool delegation, and test prohibitions are enforced
+        self.assertIn("TECH LEAD", guarded)
         self.assertIn("ask_local_assistant", guarded)
         self.assertIn("trace_symbol", guarded)
         self.assertIn("Absolute Test Prohibition", guarded)
-        self.assertIn("Zero Search Loops", guarded)
+        self.assertIn("1-TURN CONVERGENCE", guarded)
 
     @patch("urllib.request.urlopen")
     def test_ask_local_assistant_circuit_breaker_on_failure(self, mock_urlopen):
@@ -191,30 +196,23 @@ class TestMCPWorkspace(unittest.TestCase):
         self.assertTrue(res2.get("isError"))
         self.assertIn("CIRCUIT BREAKER ACTIVE", res2["content"][0]["text"])
 
-    def test_guardrail_defusal_when_circuit_breaker_active(self):
-        import mcp_workspace
-        # Simulate tripped circuit breaker
-        mcp_workspace._local_assistant_status["failures"] = 1
-        mcp_workspace._local_assistant_status["last_error"] = "Timeout"
-
-        # Large write (>30 lines) must NOT order the agent to retry ask_local_assistant
-        large_code = "\n".join([f"line_{i} = {i}" for i in range(40)])
+    def test_write_and_replace_unhandcuffed_large_files(self):
+        # Claude is now unhandcuffed: large files (>30 lines) are written without error
+        large_code = "\n".join([f"line_{i} = {i}" for i in range(50)])
         res_write = handle_write_to_file({"path": "large_file.py", "content": large_code})
-        self.assertTrue(res_write.get("isError"))
-        self.assertIn("CIRCUIT BREAKER ACTIVATED", res_write["content"][0]["text"])
-        self.assertNotIn("You MUST invoke 'ask_local_assistant", res_write["content"][0]["text"])
+        self.assertNotIn("isError", res_write)
+        created = self.test_workspace / "large_file.py"
+        self.assertTrue(created.exists())
+        self.assertEqual(len(created.read_text(encoding="utf-8").splitlines()), 50)
 
-        # Large replace (>30 lines) must NOT order the agent to retry ask_local_assistant
-        target_file = self.test_workspace / "existing.py"
-        target_file.write_text("old_block\n", encoding="utf-8")
+        # Large replace is also unhandcuffed
         res_replace = handle_replace_file_content({
-            "path": "existing.py",
-            "TargetContent": "old_block\n",
-            "ReplacementContent": large_code
+            "path": "large_file.py",
+            "TargetContent": "line_0 = 0",
+            "ReplacementContent": "line_0 = 'replaced_val'\nline_0_extra = True"
         })
-        self.assertTrue(res_replace.get("isError"))
-        self.assertIn("CIRCUIT BREAKER ACTIVATED", res_replace["content"][0]["text"])
-        self.assertNotIn("You MUST invoke 'ask_local_assistant", res_replace["content"][0]["text"])
+        self.assertNotIn("isError", res_replace)
+        self.assertIn("replaced_val", created.read_text(encoding="utf-8"))
 
     def test_run_command_sandbox_blocks_exploratory_traversals(self):
         # find / and root searches must be blocked
@@ -247,7 +245,7 @@ class TestMCPWorkspace(unittest.TestCase):
     @patch("requests.post")
     @patch("app.call_ollama_generation")
     @patch("app.execute_agy")
-    def test_local_first_triage_csv_routing(self, mock_agy, mock_ollama, mock_post):
+    def test_local_first_triage_forced_local(self, mock_agy, mock_ollama, mock_post):
         import json
         from app import process_chat_request, ChatCompletionRequest, ChatMessage
         mock_ollama.return_value = "### [data/test.csv]\ncol1,col2\nval1,val2"
@@ -261,15 +259,164 @@ class TestMCPWorkspace(unittest.TestCase):
         }
         mock_post.return_value = mock_resp
 
-        # Request with CSV in prompt should triage to Ollama directly without calling agy
+        # Explicit @local prefix triggers Ollama triage directly
         req = ChatCompletionRequest(
             model="coder",
-            messages=[ChatMessage(role="user", content="Create data/test.csv with sample domain data")]
+            messages=[ChatMessage(role="user", content="@local generate sample domain data for data/test.csv")]
         )
         res = process_chat_request(req)
         mock_agy.assert_not_called()
         mock_ollama.assert_called_once()
         self.assertIn("Local Triage: Ollama", res)
+
+
+    @patch("requests.post")
+    @patch("app.call_ollama_generation")
+    @patch("app.execute_agy")
+    def test_coding_prompt_routes_directly_to_tech_lead_agy(self, mock_agy, mock_ollama, mock_post):
+        import json
+        from app import process_chat_request, ChatCompletionRequest, ChatMessage
+        # Mock Ollama triage response
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "response": json.dumps({
+                "complexity": "trivial",
+                "target_files": ["calc.py"],
+                "beautified_prompt": "Write calc.py"
+            })
+        }
+        mock_post.return_value = mock_resp
+
+        # Mock agy resolving it cleanly as Tech Lead
+        mock_agy.return_value = "Implemented calc.py properly."
+
+        req = ChatCompletionRequest(
+            model="coder",
+            messages=[ChatMessage(role="user", content="Write a calc.py script to add two numbers")]
+        )
+        res = process_chat_request(req)
+
+        # agy MUST have been called directly because it is a coding task
+        mock_agy.assert_called_once()
+        mock_ollama.assert_not_called()
+        self.assertIn("Agent Task: Coder", res)
+
+    def test_run_command_subshell_and_chain_blocking(self):
+        # Chained commands attempting to sneak past test runner blocks
+        chained_cmds = [
+            "echo hello; pytest",
+            "ls && npm test",
+            "echo 'data' | pytest",
+            "true || cargo test"
+        ]
+        for cmd in chained_cmds:
+            res = handle_run_command({"command": cmd})
+            self.assertTrue(res.get("isError"), f"Chained command '{cmd}' should have been blocked")
+            self.assertIn("Execution Blocked", res["content"][0]["text"])
+
+    def test_path_traversal_protection(self):
+        # Traversal attempts outside workspace must be blocked safely
+        res_del = handle_delete_file({"path": "../../etc/passwd"})
+        self.assertTrue("Security Error" in str(res_del) or "No files" in str(res_del))
+
+    @patch("urllib.request.urlopen")
+    def test_ask_local_assistant_with_target_file(self, mock_urlopen):
+        # Mock local Ollama generating CSV seed data
+        mock_response = MagicMock()
+        mock_response.__iter__.return_value = [b'{"response": "col1,col2\\nval1,val2\\nval3,val4", "done": true}\n']
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
+        target_csv = "data/domains/test_domains.csv"
+        res = handle_ask_local_assistant({
+            "query": "Generate sample domain CSV data",
+            "target_file": target_csv
+        })
+        self.assertNotIn("isError", res)
+        self.assertIn("Successfully generated and saved", res["content"][0]["text"])
+        saved_file = self.test_workspace / target_csv
+        self.assertTrue(saved_file.exists())
+        self.assertIn("val1,val2", saved_file.read_text(encoding="utf-8"))
+
+    @patch("app.call_ollama_generation")
+    @patch("subprocess.run")
+    def test_agy_process_failure_fallback(self, mock_sub, mock_ollama):
+        from app import process_chat_request, ChatCompletionRequest, ChatMessage
+        # Mock agy exiting with code 1 (or 429 quota exhausted)
+        mock_sub.return_value = MagicMock(returncode=1, stdout="", stderr="429 Resource exhausted: quota exceeded")
+        mock_ollama.return_value = "Ollama fallback response"
+
+        req = ChatCompletionRequest(
+            model="coder",
+            messages=[ChatMessage(role="user", content="Fix the authentication handler in auth.py")]
+        )
+        res = process_chat_request(req)
+        # Should cleanly fall back to local Ollama without crashing
+        mock_ollama.assert_called_once()
+        self.assertIn("Fallback: Local Ollama", res)
+
+    @patch("app.call_ollama_generation")
+    @patch("subprocess.run")
+    def test_agy_timeout_fallback(self, mock_sub, mock_ollama):
+        import subprocess
+        from app import process_chat_request, ChatCompletionRequest, ChatMessage
+        # Mock agy timing out
+        mock_sub.side_effect = subprocess.TimeoutExpired(cmd="agy", timeout=180)
+        mock_ollama.return_value = "Ollama timeout fallback"
+
+        req = ChatCompletionRequest(
+            model="coder",
+            messages=[ChatMessage(role="user", content="Refactor the user model in user.py")]
+        )
+        res = process_chat_request(req)
+        mock_ollama.assert_called_once()
+        self.assertIn("Fallback: Local Ollama", res)
+
+    def test_auto_persistence_regex_extractor(self):
+        from app import auto_persist_code_blocks
+        ollama_output = (
+            "Here is the implementation:\n"
+            "### [src/utils/math_helper.py]\n"
+            "```python\n"
+            "def add_numbers(x: int, y: int) -> int:\n"
+            "    return x + y\n"
+            "```\n"
+        )
+        saved = auto_persist_code_blocks(ollama_output, str(self.test_workspace))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0], "src/utils/math_helper.py")
+        persisted_file = self.test_workspace / "src" / "utils" / "math_helper.py"
+        self.assertTrue(persisted_file.exists())
+        self.assertIn("def add_numbers", persisted_file.read_text(encoding="utf-8"))
+
+    @patch("app.process_chat_request")
+    def test_sse_keep_alive_ping_emission(self, mock_process):
+        import time
+        from app import generate_stream_response, ChatCompletionRequest, ChatMessage
+        # Mock slow process that sleeps 2.2 seconds
+        def slow_worker(req):
+            time.sleep(2.2)
+            return "Final answer from slow agent"
+        mock_process.side_effect = slow_worker
+
+        req = ChatCompletionRequest(
+            model="coder",
+            messages=[ChatMessage(role="user", content="Slow prompt")],
+            stream=True
+        )
+        stream_res = generate_stream_response(req)
+        import asyncio
+        async def collect():
+            res = []
+            async for chunk in stream_res.body_iterator:
+                res.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+            return "".join(res)
+        full_stream = asyncio.run(collect())
+        # Verify initial role chunk, keep-alive ping, and final content
+        self.assertIn('"role": "assistant"', full_stream)
+        self.assertIn(": keep-alive\n\n", full_stream)
+        self.assertIn("Final answer from slow agent", full_stream)
+        self.assertIn("data: [DONE]", full_stream)
 
 
 if __name__ == "__main__":

@@ -17,10 +17,11 @@
 - Avoid introducing unnecessary third-party dependencies unless explicitly requested.
 - Ensure all created or modified scripts, configs, and application components follow standard security and error-handling best practices.
 
-## 4. Token Economy & Local Tool Utilization
+## 4. Token Economy & Tech Lead Orchestration
 - **Pre-Read Context**: When `Workspace Pre-Read Context` is present, treat it as the compressed source of truth; avoid redundant `view_file` calls on the same files.
 - **Local Helper Tools**: Prefer `trace_symbol` and `ask_local_assistant` MCP tools for call-graph tracing and codebase inquiries to preserve token budget.
-- **Heavy Code Generation via Local Ollama**: For new files or extensive multi-line implementations, invoke `ask_local_assistant(query="...", target_file="...")` to generate and persist files directly to disk at 0 cloud tokens. Reserve direct cloud edits for minimal tweaks (< 5% token impact).
+- **Tech Lead Direct Execution**: The primary agent acts as Tech Lead, directly implementing core business logic, complex algorithms, and test suites using `write_to_file` and `replace_file_content` in 1 single turn.
+- **Boilerplate & Seed Data Delegation**: For repetitive boilerplate, mock fixtures, seed data CSVs, and API schemas, invoke `ask_local_assistant(query="...", target_file="...")` to generate and persist files directly to disk at 0 cloud tokens.
 
 ## Code Style & Formatting Preservation Rules
 

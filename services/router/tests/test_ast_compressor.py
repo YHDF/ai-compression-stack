@@ -7,6 +7,7 @@ Validates compression ratios, syntax safety, context preservation, and edge case
 import unittest
 from ast_compressor import (
     compress_python_code,
+    compress_python_to_skeleton,
     compress_json,
     compress_c_family_code,
     compress_log_file,
@@ -258,6 +259,64 @@ Paragraph 2 text after blank lines.
         stats = get_stats()
         self.assertGreater(stats["total_requests"], 0)
         self.assertIn("savings_percentage", stats)
+
+    def test_compress_python_to_skeleton(self):
+        from ast_compressor import compress_python_to_skeleton
+        full_code = (
+            "class UserService:\n"
+            "    def __init__(self, db: Database):\n"
+            "        self.db = db\n"
+            "        self.cache = {}\n\n"
+            "    def get_user(self, user_id: int) -> dict:\n"
+            "        if user_id in self.cache:\n"
+            "            return self.cache[user_id]\n"
+            "        user = self.db.find_one({'id': user_id})\n"
+            "        self.cache[user_id] = user\n"
+            "        return user\n"
+        )
+        skeleton = compress_python_to_skeleton(full_code)
+        self.assertIn("class UserService", skeleton)
+        self.assertIn("def get_user(self, user_id: int) -> dict:", skeleton)
+        # Function body should be collapsed to Ellipsis (...)
+        self.assertIn("...", skeleton)
+        self.assertNotIn("self.db.find_one", skeleton)
+        self.assertLess(len(skeleton), len(full_code))
+
+    def test_compress_binary_and_non_utf8_files(self):
+        # Binary data decoded with replace should pass through safely without crashing
+        binary_data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        try:
+            text = binary_data.decode("utf-8", errors="replace")
+            res, orig_tok, comp_tok = compress_code_snippet(text, filename="image.png")
+            self.assertGreater(orig_tok, 0)
+        except Exception as e:
+            self.fail(f"Compressor should not crash on binary data: {e}")
+
+    def test_ast_skeletonizer_complex_python_features(self):
+        complex_py = (
+            "@dataclass\n"
+            "class Config:\n"
+            "    host: str = 'localhost'\n\n"
+            "class AsyncService:\n"
+            "    @property\n"
+            "    def is_active(self) -> bool:\n"
+            "        return True\n\n"
+            "    async def fetch_data(self, url: str) -> dict:\n"
+            "        return {'status': 200}\n"
+        )
+        skeleton = compress_python_to_skeleton(complex_py)
+        self.assertIn("@dataclass", skeleton)
+        self.assertIn("class Config", skeleton)
+        self.assertIn("class AsyncService", skeleton)
+        self.assertIn("async def fetch_data", skeleton)
+        self.assertIn("...", skeleton)
+
+    def test_ast_compressor_empty_and_whitespace_files(self):
+        empty_res, _, _ = compress_code_snippet("", filename="empty.py")
+        self.assertEqual(empty_res, "")
+
+        ws_res, _, _ = compress_code_snippet("   \n\n   \t\n", filename="ws.py")
+        self.assertEqual(ws_res, "")
 
 
 if __name__ == "__main__":

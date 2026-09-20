@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 AST-based Code Compressor and Token Optimization Engine.
-Prunes comments, docstrings, redundant whitespace, and structures
-code to minimize token consumption before sending context to LLMs.
+Prunes comments, docstrings, and redundant whitespace to minimize token usage.
 """
 
 import os
@@ -10,6 +9,7 @@ import ast
 import json
 import re
 from typing import Tuple, Dict, Any
+
 
 class GlobalStats:
     total_requests: int = 0
@@ -19,17 +19,18 @@ class GlobalStats:
     total_compressed_tokens: int = 0
     tokens_saved: int = 0
 
+
 def estimate_tokens(text: str) -> int:
     """Rough estimation of token count (~4 characters per token)."""
     return max(1, len(text) // 4)
 
+
 class DocstringRemover(ast.NodeTransformer):
     """AST Transformer to strip docstrings from modules, classes, and functions."""
     def _strip_docstring(self, node):
-        if (node.body and 
-            isinstance(node.body[0], ast.Expr) and 
-            isinstance(node.body[0].value, (ast.Str, ast.Constant)) and
-            isinstance(getattr(node.body[0].value, 'value', None), str)):
+        if (node.body and isinstance(node.body[0], ast.Expr) and
+                isinstance(node.body[0].value, ast.Constant) and
+                isinstance(getattr(node.body[0].value, 'value', None), str)):
             node.body.pop(0)
         return node
 
@@ -49,234 +50,179 @@ class DocstringRemover(ast.NodeTransformer):
         self.generic_visit(node)
         return self._strip_docstring(node)
 
+
+class Skeletonizer(ast.NodeTransformer):
+    """AST Transformer to replace function/method bodies with '...' (signatures only)."""
+    def visit_FunctionDef(self, node):
+        node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        return node
+
+
+def compress_python_to_skeleton(code: str) -> str:
+    """Extract structural interface skeleton (classes, signatures, types) at ~80% token savings."""
+    try:
+        tree = ast.parse(code)
+        tree = DocstringRemover().visit(tree)
+        tree = Skeletonizer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception:
+        return compress_python_code(code)
+
+
 def compress_python_code(code: str) -> str:
     """Minify Python code using AST parsing and unparsing."""
     try:
         tree = ast.parse(code)
-        transformer = DocstringRemover()
-        tree = transformer.visit(tree)
+        tree = DocstringRemover().visit(tree)
         ast.fix_missing_locations(tree)
-        # ast.unparse removes comments, docstrings, and redundant blank lines
-        compressed = ast.unparse(tree)
-        return compressed
+        return ast.unparse(tree)
     except Exception:
-        # Fallback to regex-based comment/whitespace stripping
         return strip_generic_whitespace(code)
+
 
 def compress_json(text: str) -> str:
     """Minify JSON by removing indentation and whitespace."""
     try:
-        data = json.loads(text)
-        return json.dumps(data, separators=(',', ':'))
+        return json.dumps(json.loads(text), separators=(',', ':'))
     except Exception:
         return text.strip()
 
-def compress_aggressive_fallback(text: str, max_lines: int = 150) -> str:
-    """
-    Aggressive universal fallback compressor for unrecognized file formats:
-    - Strips full-line comments (#, //, ;, %) common across configs, scripts, and DSLs.
-    - Halves indentation whitespace (e.g. 4 spaces -> 2 spaces) while strictly preserving hierarchy.
-    - Collapses repetitive divider runs (e.g., ---------- or ==========) to 3 characters.
-    - Compresses excessive internal whitespace and eliminates blank lines.
-    - Applies a head/tail budget window for files exceeding max_lines.
-    """
-    try:
-        lines = text.splitlines()
-        cleaned = []
-        for i, raw_line in enumerate(lines):
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            # Preserve shebang
-            if i == 0 and stripped.startswith("#!"):
-                cleaned.append(stripped)
-                continue
-            # Strip full-line comments
-            if stripped.startswith(("#", "//", ";", "%")):
-                continue
-
-            # Collapse repetitive divider characters
-            line = re.sub(r'([-=~*#_]){4,}', r'\1\1\1', raw_line)
-
-            # Compress 4-space / 8-space indentation to 2-space / 4-space indentation
-            leading_spaces = len(line) - len(line.lstrip(" "))
-            content_part = line.lstrip(" ")
-            # Collapse multiple internal spaces
-            content_part = re.sub(r'[ \t]{2,}', ' ', content_part)
-
-            indent = " " * (leading_spaces // 2) if leading_spaces > 1 else (" " * leading_spaces)
-            cleaned.append(indent + content_part)
-
-        if len(cleaned) > max_lines:
-            head = cleaned[:80]
-            tail = cleaned[-40:]
-            omitted = len(cleaned) - 120
-            cleaned = head + [f"... [{omitted} lines omitted to preserve token budget] ..."] + tail
-
-        return "\n".join(cleaned)
-    except Exception:
-        return strip_generic_whitespace(text)
 
 def strip_generic_whitespace(text: str) -> str:
     """Strip redundant whitespace, blank lines, and empty lines."""
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
+
 
 def compress_c_family_code(code: str) -> str:
-    """Strip comments, collapse newlines, brackets, and separators from C-style languages (JS, TS, C, C++, Java, Go, Rust, C#, PHP)."""
+    """Strip comments and collapse whitespace in C-family languages (JS, TS, C, Java, Go, Rust)."""
     pattern = r'(\'\'\'|"""|\'([^\'\\]*(\\.[^\'\\]*)*)\'|"([^"\\]*(\\.[^"\\]*)*)"|`([^`\\]*(\\.[^`\\]*)*)`)|(/\*[\s\S]*?\*/|//[^\r\n]*)'
-    def replacer(match):
-        if match.group(1):
-            return match.group(1)
-        return ""
     try:
-        stripped = re.sub(pattern, replacer, code)
+        stripped = re.sub(pattern, lambda m: m.group(1) or "", code)
         lines = [line.strip() for line in stripped.splitlines() if line.strip()]
         result = "\n".join(lines)
-        # Collapse newlines around braces, semicolons, and commas
         result = re.sub(r'\s*([\{\}\;,])\s*\n\s*', r'\1 ', result)
-        result = re.sub(r'\n{2,}', '\n', result)
-        return result.strip()
+        return re.sub(r'\n{2,}', '\n', result).strip()
     except Exception:
         return strip_generic_whitespace(code)
 
+
 def compress_log_file(content: str, max_lines: int = 100) -> str:
-    """
-    Compress application logs (Spring Boot, Node.js, Python) by extracting:
-    - Error / Fatal / Exception log lines
-    - 'Caused by:' exception root causes
-    - User application stack frames (omitting repetitive internal framework frames)
-    """
+    """Compress application logs by keeping errors and filtering repetitive framework frames."""
     try:
-        lines = content.splitlines()
-        filtered = []
-        framework_prefixes = (
-            "at org.springframework.", "at org.apache.", "at jakarta.servlet.",
-            "at javax.servlet.", "at sun.reflect.", "at java.base/",
-            "at node:internal/", "at express/lib/", "at module.js:"
-        )
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # Keep log level indicators and exception declarations
-            if any(kw in stripped for kw in ("ERROR", "FATAL", "Exception", "Caused by:", "Error:", "FAIL")):
-                filtered.append(line.rstrip())
-                continue
-            # Keep stack trace lines except framework noise
-            if stripped.startswith("at "):
-                if not any(stripped.startswith(prefix) for prefix in framework_prefixes):
-                    filtered.append(line.rstrip())
-                continue
-            # Keep general non-framework lines
-            filtered.append(line.rstrip())
-
+        lines = [l.rstrip() for l in content.splitlines() if l.strip()]
+        framework_prefixes = ("at org.springframework.", "at org.apache.", "at jakarta.", "at javax.", "at sun.", "at java.base/")
+        filtered = [
+            l for l in lines
+            if any(k in l for k in ("ERROR", "FATAL", "Exception", "Caused by:", "FAIL"))
+            or (l.strip().startswith("at ") and not any(l.strip().startswith(p) for p in framework_prefixes))
+            or not l.strip().startswith("at ")
+        ]
         if len(filtered) > max_lines:
-            head = filtered[:max_lines - 20]
-            tail = filtered[-20:]
             omitted = len(filtered) - max_lines
-            filtered = head + [f"... [{omitted} framework/verbose log lines omitted to conserve tokens] ..."] + tail
-
+            filtered = filtered[:max_lines - 20] + [f"... [{omitted} log lines omitted to conserve tokens] ..."] + filtered[-20:]
         return "\n".join(filtered)
     except Exception:
         return strip_generic_whitespace(content)
 
+
 def compress_html_xml(content: str) -> str:
-    """Strip HTML/XML comments and collapse multi-line whitespace."""
+    """Strip HTML/XML comments and collapse whitespace."""
     try:
-        no_comments = re.sub(r'<!--[\s\S]*?-->', '', content)
-        lines = [line.strip() for line in no_comments.splitlines() if line.strip()]
-        return "\n".join(lines)
+        return "\n".join(l.strip() for l in re.sub(r'<!--[\s\S]*?-->', '', content).splitlines() if l.strip())
     except Exception:
         return strip_generic_whitespace(content)
+
 
 def compress_css(content: str) -> str:
     """Strip CSS comments and redundant indentation."""
     try:
-        no_comments = re.sub(r'/\*[\s\S]*?\*/', '', content)
-        lines = [line.strip() for line in no_comments.splitlines() if line.strip()]
-        return "\n".join(lines)
+        return "\n".join(l.strip() for l in re.sub(r'/\*[\s\S]*?\*/', '', content).splitlines() if l.strip())
     except Exception:
         return strip_generic_whitespace(content)
+
 
 def compress_shell_script(content: str) -> str:
     """Strip shell comments while preserving the shebang line."""
     try:
-        lines = content.splitlines()
-        result = []
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if i == 0 and stripped.startswith("#!"):
-                result.append(stripped)
-            elif stripped.startswith("#"):
-                continue
-            else:
-                result.append(line.rstrip())
-        return "\n".join(result)
+        return "\n".join(
+            l.strip() if i == 0 and l.strip().startswith("#!") else l.rstrip()
+            for i, l in enumerate(content.splitlines())
+            if l.strip() and (i == 0 and l.strip().startswith("#!") or not l.strip().startswith("#"))
+        )
     except Exception:
         return strip_generic_whitespace(content)
 
+
 def compress_yaml(content: str) -> str:
-    """Strip comment-only lines in YAML while strictly preserving indentation."""
+    """Strip comment-only lines in YAML while preserving indentation."""
     try:
-        lines = content.splitlines()
-        result = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            result.append(line.rstrip())
-        return "\n".join(result)
+        return "\n".join(l.rstrip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#"))
     except Exception:
         return strip_generic_whitespace(content)
+
 
 def compress_sql(content: str) -> str:
     """Strip single-line and multi-line SQL comments."""
     try:
         no_block = re.sub(r'/\*[\s\S]*?\*/', '', content)
         no_line = re.sub(r'--[^\r\n]*', '', no_block)
-        lines = [line.strip() for line in no_line.splitlines() if line.strip()]
-        return "\n".join(lines)
+        return "\n".join(l.strip() for l in no_line.splitlines() if l.strip())
     except Exception:
         return strip_generic_whitespace(content)
 
+
 def compress_tabular_data(content: str, max_rows: int = 15) -> str:
-    """Compact CSV/TSV data; truncate huge datasets to a representative sample with schema header."""
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    """Compact CSV/TSV data; truncate huge datasets to a representative sample."""
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
     if len(lines) <= max_rows:
         return "\n".join(lines)
-    header = lines[0]
-    sample = lines[1:max_rows]
     omitted = len(lines) - max_rows
-    sample.append(f"... [{omitted} rows omitted to conserve tokens; total {len(lines)} rows]")
-    return "\n".join([header] + sample)
+    return "\n".join([lines[0]] + lines[1:max_rows] + [f"... [{omitted} rows omitted to conserve tokens; total {len(lines)} rows]"])
+
 
 def compress_markdown(content: str) -> str:
     """Strip HTML comments and excessive blank lines from Markdown."""
     try:
-        no_comments = re.sub(r'<!--[\s\S]*?-->', '', content)
-        # Collapse 3+ newlines into 2
-        return re.sub(r'\n{3,}', '\n\n', no_comments).strip()
+        return re.sub(r'\n{3,}', '\n\n', re.sub(r'<!--[\s\S]*?-->', '', content)).strip()
     except Exception:
         return strip_generic_whitespace(content)
 
-def compress_code_snippet(content: str, filename: str = "") -> Tuple[str, int, int]:
-    """
-    Compress a code snippet based on its file extension.
-    Returns: (compressed_text, orig_tokens, comp_tokens)
-    """
+
+def compress_aggressive_fallback(text: str, max_lines: int = 150) -> str:
+    """Universal fallback compressor for unknown formats: strips comments, halves indentation."""
+    try:
+        cleaned = []
+        for i, raw_line in enumerate(text.splitlines()):
+            stripped = raw_line.strip()
+            if not stripped or (stripped.startswith(("#", "//", ";", "%")) and not (i == 0 and stripped.startswith("#!"))):
+                continue
+            line = re.sub(r'([-=~*#_]){4,}', r'\1\1\1', raw_line)
+            leading = len(line) - len(line.lstrip(" "))
+            cleaned.append((" " * (leading // 2 if leading > 1 else leading)) + re.sub(r'[ \t]{2,}', ' ', line.lstrip(" ")))
+
+        if len(cleaned) > max_lines:
+            omitted = len(cleaned) - 120
+            cleaned = cleaned[:80] + [f"... [{omitted} lines omitted to preserve token budget] ..."] + cleaned[-40:]
+        return "\n".join(cleaned)
+    except Exception:
+        return strip_generic_whitespace(text)
+
+
+def compress_code_snippet(content: str, filename: str = "", skeleton_only: bool = False) -> Tuple[str, int, int]:
+    """Compress code based on extension. Returns: (compressed_text, orig_tokens, comp_tokens)."""
     orig_tokens = estimate_tokens(content)
-    lower_fn = filename.lower()
-    ext = os.path.splitext(lower_fn)[1]
+    ext = os.path.splitext(filename.lower())[1]
 
     if ext == ".py":
-        compressed = compress_python_code(content)
+        compressed = compress_python_to_skeleton(content) if skeleton_only else compress_python_code(content)
     elif ext == ".json":
         compressed = compress_json(content)
-    elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".c", ".cpp", ".cc", ".h", ".hpp", ".java", ".go", ".rs", ".cs", ".php", ".vue", ".svelte"):
+    elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".c", ".cpp", ".cc", ".h", ".java", ".go", ".rs", ".cs", ".php"):
         compressed = compress_c_family_code(content)
     elif ext in (".html", ".htm", ".xml", ".svg"):
         compressed = compress_html_xml(content)
@@ -308,16 +254,15 @@ def compress_code_snippet(content: str, filename: str = "") -> Tuple[str, int, i
 
     return compressed, orig_tokens, comp_tokens
 
+
 def get_stats() -> Dict[str, Any]:
     """Retrieve cumulative AST compression statistics."""
     saved = GlobalStats.tokens_saved
     orig = GlobalStats.total_original_tokens
-    ratio = (saved / orig * 100) if orig > 0 else 0.0
-
     return {
         "total_requests": GlobalStats.total_requests,
         "original_tokens": orig,
         "compressed_tokens": GlobalStats.total_compressed_tokens,
         "tokens_saved": saved,
-        "savings_percentage": round(ratio, 2)
+        "savings_percentage": round((saved / orig * 100) if orig > 0 else 0.0, 2)
     }
