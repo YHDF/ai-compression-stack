@@ -20,9 +20,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 HEADROOM_PROXY = os.getenv("HEADROOM_PROXY", "http://headroom:8787").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b").strip()
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 AGY_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-medium").strip()
-AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "600"))
+AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT", "180"))
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 
 MAX_PRE_READ_SIZE = 50 * 1024  # 50 KB limit
@@ -60,6 +60,8 @@ def ensure_workspace_mcp():
         server_def = {
             "command": "python3",
             "args": [mcp_script],
+            "timeout": 300,
+            "toolTimeout": 300,
             "disabled": False
         }
 
@@ -498,7 +500,7 @@ def apply_guardrails(beautified_prompt: str, context_str: str) -> str:
         "- All relevant code is already provided below in 'Workspace Pre-Read Context'. Prefer 'trace_symbol' and 'ask_local_assistant' for call-graph inquiries.\n"
         "- To create or update files, you MUST invoke 'ask_local_assistant(query=\"...\", target_file=\"path/to/file.ext\")'. Local Ollama will generate and write the code directly to disk at ZERO cloud tokens.\n"
         "- Direct edits without Ollama are strictly prohibited unless it is a 1-2 line trivial fix via 'replace_file_content'.\n"
-        "- FAST CONVERGENCE & Zero Search Loops: Complete your entire task in 1 single turn. Do NOT engage in multi-turn exploratory loops.\n"
+        "- STRICT 1-TURN CONVERGENCE & Zero Search Loops: Complete your entire task in 1 single turn. If any tool call reports an error or times out, STOP immediately, summarize what occurred, and do NOT retry or attempt autonomous recovery.\n"
         "- Absolute Test Prohibition: NEVER run test suites ('npm test', 'pytest', etc.). Instruct the user to execute tests locally under Next Steps.\n\n"
     )
     parts = [guardrails]
@@ -528,7 +530,7 @@ def auto_persist_code_blocks(output_text: str, workspace_dir: str, default_targe
     VALID_EXTS = {
         ".js", ".jsx", ".ts", ".tsx", ".py", ".json", ".yml", ".yaml",
         ".md", ".sh", ".bash", ".sql", ".html", ".css", ".env", ".example",
-        ".txt", ".cfg", ".ini", ".toml", ".xml", ".dockerfile"
+        ".txt", ".cfg", ".ini", ".toml", ".xml", ".dockerfile", ".csv", ".tsv"
     }
 
     # Match each markdown code block
@@ -655,6 +657,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         "--model", AGY_MODEL,
         "--mode", "accept-edits",
         "--dangerously-skip-permissions",
+        "--max-turns", "2",
         "--print-timeout", f"{AGY_TIMEOUT}s"
     ]
     if agent_id:
@@ -677,7 +680,7 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
     env["HOME"] = home_dir
     cwd = WORKSPACE_DIR if os.path.exists(WORKSPACE_DIR) else "/workspace"
 
-    # Ensure workspace is registered in trustedWorkspaces
+    # Ensure workspace is registered in trustedWorkspaces and toolTimeout is generous
     try:
         cli_settings = os.path.join(home_dir, ".gemini", "antigravity-cli", "settings.json")
         if os.path.exists(cli_settings):
@@ -686,8 +689,10 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
             tw = cfg.setdefault("trustedWorkspaces", [])
             if cwd not in tw:
                 tw.append(cwd)
-                with open(cli_settings, "w") as f:
-                    json.dump(cfg, f, indent=2)
+            cfg["toolTimeout"] = 300
+            cfg["mcpTimeout"] = 300
+            with open(cli_settings, "w") as f:
+                json.dump(cfg, f, indent=2)
     except Exception as e:
         print(f"Notice: could not verify trustedWorkspaces: {e}", flush=True)
 
@@ -796,33 +801,38 @@ def process_chat_request(req: ChatCompletionRequest) -> str:
         gen_out = call_ollama_generation(f"[Image content attached] {prompt_text}")
         return "*[Fallback: Local Ollama]*\n\n" + gen_out
 
-    # 3. Unified Inbound Pipeline: Ollama Context Synthesizer (0 Cloud Tokens)
-    # Extracts the essential technical brief and target files so agy is only invoked with necessary info
+    # 3. Unified Inbound Pipeline: Ollama Context Synthesizer & Triage Classifier (0 Cloud Tokens)
     synthesized_prompt = clean_prompt or prompt_text
     target_files = []
+    complexity = "complex"
     try:
         structured_schema = {
             "type": "object",
             "properties": {
                 "beautified_prompt": {
                     "type": "string",
-                    "description": "Clean, concise, and structured technical specification converted from user prompt, with all conversational noise stripped."
+                    "description": "Clean technical specification converted from user prompt."
                 },
                 "target_files": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Specific file paths in the workspace directly implicated by the task."
+                },
+                "complexity": {
+                    "type": "string",
+                    "enum": ["trivial", "complex"],
+                    "description": "trivial for data files (csv, json, txt, yaml), single isolated scripts/utilities, simple edits, or Q&A; complex for multi-file architectural refactors or cross-system changes."
                 }
             },
-            "required": ["beautified_prompt"]
+            "required": ["beautified_prompt", "complexity"]
         }
         ollama_res = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": (
-                    "You are a technical requirements synthesizer. Convert this user request into a precise, structured technical specification. "
-                    "Eliminate conversational chatter, pleasantries, and ambiguity. Extract any directly referenced or target file paths:\n\n"
+                    "You are a technical requirements analyzer and triage classifier. "
+                    "Analyze this user request, extract target files, classify complexity (trivial vs complex), and synthesize a clean brief:\n\n"
                     f"{clean_prompt or prompt_text}"
                 ),
                 "format": structured_schema,
@@ -834,9 +844,16 @@ def process_chat_request(req: ChatCompletionRequest) -> str:
             resp_json = ollama_res.json()
             raw_meta = json.loads(resp_json.get("response", "{}"))
             if isinstance(raw_meta, dict):
-                synthesized_prompt = raw_meta.get("beautified_prompt") or synthesized_prompt
                 target_files = raw_meta.get("target_files", [])
-                print(f"[ROUTER] Ollama synthesized specification ({len(synthesized_prompt)} chars), target files: {target_files}", flush=True)
+                complexity = raw_meta.get("complexity", "complex")
+                bp = (raw_meta.get("beautified_prompt") or "").strip()
+                # Preserve verbatim content if prompt contains lists, code, schemas, or specific data
+                has_verbatim_data = any(sym in clean_prompt for sym in ["\n", "```", ".csv", ".py", "{", "}", ",", "def ", "class "])
+                if bp and not has_verbatim_data and len(bp) >= len(clean_prompt) * 0.7:
+                    synthesized_prompt = bp
+                else:
+                    synthesized_prompt = clean_prompt or prompt_text
+                print(f"[ROUTER] Inbound synthesis: complexity={complexity}, {len(synthesized_prompt)} chars, target files: {target_files}", flush=True)
     except Exception as e:
         print(f"[ROUTER] Ollama synthesis notice: {e}", flush=True)
 
@@ -855,9 +872,35 @@ def process_chat_request(req: ChatCompletionRequest) -> str:
     print(f"[ROUTER] Validated target files for AST pre-read: {real_targets}", flush=True)
     ws_context = read_target_files(real_targets) if real_targets else ""
 
-    # 5. Dispatch to agy (Gemini Orchestrator) with Division of Labor Guardrails
-    guarded_prompt = apply_guardrails(synthesized_prompt, ws_context)
+    # 5. Local-First Triage Gate: Zero Cloud Tokens for Trivial & Data Tasks
     selected_agent = agent_id or "coder"
+    forced_cloud = any(clean_prompt.lower().startswith(p) for p in ["@agy", "/agy", "@gemini", "/gemini", "@cloud", "/cloud"])
+    forced_local = any(clean_prompt.lower().startswith(p) for p in ["@local", "/local", "@ollama", "/ollama"])
+    is_data_file = any(
+        tf.lower().endswith((".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".md", ".env"))
+        for tf in target_files
+    ) or any(ext in clean_prompt.lower() for ext in [".csv", ".tsv", ".json", ".yaml", ".yml"])
+
+    is_trivial = (
+        forced_local
+        or (complexity == "trivial")
+        or (is_data_file and not forced_cloud)
+    ) and not forced_cloud
+
+    if is_trivial:
+        print(f"[ROUTER] Target: Local Ollama (Triage: 0 Cloud Tokens) | Persona: {selected_agent}", flush=True)
+        local_out = call_ollama_generation(clean_prompt or prompt_text, persona=selected_agent, ws_context=ws_context)
+        saved_files = []
+        if local_out and selected_agent == "coder":
+            try:
+                saved_files = auto_persist_code_blocks(local_out, WORKSPACE_DIR, default_target_files=target_files)
+            except Exception as e:
+                print(f"[ROUTER] Notice in auto_persist_code_blocks (triage): {e}", flush=True)
+        saved_badge = f"\n\n*[Files saved to workspace: {', '.join(saved_files)}]*" if saved_files else ""
+        return f"*[Local Triage: Ollama ({selected_agent.capitalize()} | 0 Cloud Tokens)]*" + saved_badge + "\n\n" + local_out
+
+    # 6. Dispatch to agy (Gemini Orchestrator) with Division of Labor Guardrails & Max Turns
+    guarded_prompt = apply_guardrails(synthesized_prompt, ws_context)
     agy_output = execute_agy(guarded_prompt, agent_id=selected_agent)
     if agy_output is not None:
         from ast_compressor import get_stats
@@ -866,9 +909,9 @@ def process_chat_request(req: ChatCompletionRequest) -> str:
         badge = f"*[Agent Task: {selected_agent.capitalize()} ({AGY_MODEL}){saved_str}]*\n\n"
         return badge + agy_output
 
-    # 6. Automatic Fallback to Local Ollama with Direct Workspace Disk Persistence
+    # 7. Automatic Fallback to Local Ollama with Direct Workspace Disk Persistence
     print(f"[ROUTER] agy failed or quota exhausted; invoking Ollama fallback (model={OLLAMA_MODEL}, persona={selected_agent})", flush=True)
-    fallback_out = call_ollama_generation(synthesized_prompt, persona=selected_agent, ws_context=ws_context)
+    fallback_out = call_ollama_generation(clean_prompt or prompt_text, persona=selected_agent, ws_context=ws_context)
     saved_files = []
     if fallback_out and selected_agent == "coder":
         try:

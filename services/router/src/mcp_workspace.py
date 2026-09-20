@@ -13,6 +13,12 @@ from pathlib import Path
 
 WORKSPACE_ROOT = os.getenv("WORKSPACE_DIR", "/workspace")
 
+# Tool-level session state for circuit breakers
+_local_assistant_status = {
+    "failures": 0,
+    "last_error": None
+}
+
 def normalize_path(target_path: str) -> Path:
     p = Path(target_path)
     if not p.is_absolute():
@@ -41,9 +47,22 @@ def handle_replace_file_content(args: dict) -> dict:
     if not target_path or target_content is None:
         return {"content": [{"type": "text", "text": "Error: missing 'path' or 'TargetContent'"}], "isError": True}
 
-    # Hard Quota Guardrail: Prevent cloud agent from dumping massive code diffs
+    # Hard Quota Guardrail & Circuit Breaker: Prevent cloud agent from dumping massive code diffs
     rep_lines = len(replacement_content.strip().splitlines())
     if rep_lines > 30:
+        if _local_assistant_status.get("failures", 0) > 0:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"CIRCUIT BREAKER ACTIVATED: Cloud diff of {rep_lines} lines blocked. "
+                        "Local assistant already failed previously. Multi-turn retry loops are strictly "
+                        "prohibited to protect upstream token quota. Please conclude your task immediately "
+                        "and report the failure under Next Steps."
+                    )
+                }],
+                "isError": True
+            }
         return {
             "content": [{
                 "type": "text",
@@ -76,9 +95,22 @@ def handle_write_to_file(args: dict) -> dict:
     if not target_path:
         return {"content": [{"type": "text", "text": "Error: missing required 'path' parameter"}], "isError": True}
 
-    # Hard Quota Guardrail: Prevent cloud agent from writing entire files via cloud tokens
+    # Hard Quota Guardrail & Circuit Breaker: Prevent cloud agent from writing entire files via cloud tokens
     content_lines = len(content.strip().splitlines())
     if content_lines > 30:
+        if _local_assistant_status.get("failures", 0) > 0:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"CIRCUIT BREAKER ACTIVATED: Direct write of {content_lines} lines blocked. "
+                        "Local assistant already failed previously. Multi-turn retry loops are strictly "
+                        "prohibited to protect upstream token quota. Please conclude your task immediately "
+                        "and report the failure under Next Steps."
+                    )
+                }],
+                "isError": True
+            }
         return {
             "content": [{
                 "type": "text",
@@ -183,12 +215,51 @@ def handle_run_command(args: dict) -> dict:
                 }],
                 "isError": True
             }
+
+    # Strict token preservation & sandboxing: Block exploratory system searches outside /workspace
+    traversal_patterns = [
+        r"\bfind\s+(?:/|/home|/root|/app|~|\.\.)",
+        r"\bgrep\b.*?\s+(?:/|/home|/root|/app|~|\.\.)",
+        r"\bcat\s+.*?(?:\.bash_history|history)",
+        r"\bhistory\b",
+        r"(?:/home/appuser/\.gemini|/\.gemini|\bbrain\b)",
+        r"\bls\s+.*?(?:/|/home|/root|/app|~|\.gemini|\.\.)",
+    ]
+    for tp in traversal_patterns:
+        if re.search(tp, lowered_cmd):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"Execution Blocked: Exploratory system search ('{cmd_str}') outside /workspace is strictly "
+                        "prohibited to preserve token quota. Limit all operations strictly to /workspace."
+                    )
+                }],
+                "isError": True
+            }
     
+    # Circuit breaker: Block shell-based file write attempts to evade guardrails after failure
+    if _local_assistant_status.get("failures", 0) > 0:
+        if any(w in lowered_cmd for w in ["cat <<", "echo ", "tee ", "printf "]) and any(w in lowered_cmd for w in [">", ">>"]):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "Execution Blocked: Shell file-write workarounds are blocked because the local assistant "
+                        "circuit breaker is active. Multi-turn recovery loops are prohibited to protect cloud token quota. "
+                        "Conclude response immediately."
+                    )
+                }],
+                "isError": True
+            }
+
     # Environment with non-interactive defaults
     env = os.environ.copy()
     env["CI"] = "true"
     env["DEBIAN_FRONTEND"] = "noninteractive"
     env["PAGER"] = "cat"
+
+    safe_cwd = WORKSPACE_ROOT if not cwd or not str(cwd).startswith(WORKSPACE_ROOT) else cwd
 
     try:
         proc = subprocess.run(
@@ -198,9 +269,9 @@ def handle_run_command(args: dict) -> dict:
             stdin=subprocess.DEVNULL,       # Prevent hanging on interactive prompts
             capture_output=True,
             text=True,
-            cwd=cwd,
+            cwd=safe_cwd,
             env=env,
-            timeout=120                     # 2 minutes for tests / installs
+            timeout=30                      # Fast 30s timeout to prevent hangs
         )
         output = proc.stdout or ""
         if proc.stderr:
@@ -215,7 +286,7 @@ def handle_run_command(args: dict) -> dict:
 
         return {"content": [{"type": "text", "text": output or "(command finished with no output)"}]}
     except subprocess.TimeoutExpired:
-        return {"content": [{"type": "text", "text": "Execution timed out (120s limit). If running a daemon/server, run it in background."}], "isError": True}
+        return {"content": [{"type": "text", "text": "Execution timed out (30s limit). If running a daemon/server, run it in background."}], "isError": True}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Execution error: {e}"}], "isError": True}
 
@@ -299,15 +370,31 @@ def handle_ask_local_assistant(args: dict) -> dict:
     if not query:
         return {"content": [{"type": "text", "text": "Error: missing required 'query' parameter"}], "isError": True}
 
+    # Circuit breaker: Block repeated calls if local assistant already failed in this session
+    if _local_assistant_status.get("failures", 0) > 0:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"CIRCUIT BREAKER ACTIVE: Local assistant already failed previously "
+                    f"({_local_assistant_status.get('last_error', 'unknown error')}). "
+                    "Repeated invocations are blocked to prevent infinite token-draining retry loops. "
+                    "Conclude your execution now and report under Next Steps."
+                )
+            }],
+            "isError": True
+        }
+
     # Automatically retrieve local workspace snippets if no explicit context was passed
     if not context:
         auto_snippets = retrieve_local_workspace_context(query)
         if auto_snippets:
-            context = auto_snippets
+            # Cap snippet context length to 1500 chars to avoid CPU prompt processing slowdown
+            context = auto_snippets[:1500]
 
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:0.5b")
-    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 
     system_prompt = (
         "You are an expert autonomous software engineer and implementation engine. "
@@ -327,9 +414,11 @@ def handle_ask_local_assistant(args: dict) -> dict:
     req_body = json.dumps({
         "model": ollama_model,
         "prompt": full_prompt,
-        "stream": False,
+        "stream": True,
+        "keep_alive": "24h",
         "options": {
-            "num_predict": 2048,
+            "num_predict": 768,
+            "num_ctx": 2048,
             "temperature": 0.2
         }
     }).encode("utf-8")
@@ -342,8 +431,24 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
     try:
         with urllib.request.urlopen(req, timeout=ollama_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            answer = data.get("response", "").strip()
+            parts = []
+            for line in resp:
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                    delta = chunk.get("response", "")
+                    if delta:
+                        parts.append(delta)
+                    if chunk.get("done", False):
+                        break
+                except Exception:
+                    continue
+                # Keep stdio pipe active so client tool runner does not time out
+                sys.stderr.write(".")
+                sys.stderr.flush()
+
+            answer = "".join(parts).strip()
 
             # If target_file is specified, persist code directly to disk at 0 cloud cost!
             if target_file:
@@ -361,7 +466,8 @@ def handle_ask_local_assistant(args: dict) -> dict:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
                 resolved.write_text(code_to_write, encoding="utf-8")
                 line_count = len(code_to_write.splitlines())
-                print(f"[MCP] Ollama generated and wrote {resolved} ({len(code_to_write)} bytes, {line_count} lines)", flush=True)
+                sys.stderr.write(f"[MCP] Ollama generated and wrote {resolved} ({len(code_to_write)} bytes, {line_count} lines)\n")
+                sys.stderr.flush()
                 return {
                     "content": [{
                         "type": "text",
@@ -371,7 +477,19 @@ def handle_ask_local_assistant(args: dict) -> dict:
 
             return {"content": [{"type": "text", "text": f"[Local Ollama ({ollama_model} | 0 Cloud Tokens)]:\n{answer}"}]}
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Local assistant query failed: {e}"}], "isError": True}
+        _local_assistant_status["failures"] += 1
+        _local_assistant_status["last_error"] = str(e)
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"CIRCUIT BREAKER: Local assistant failed ({e}). "
+                    "DO NOT retry ask_local_assistant and DO NOT attempt multi-turn autonomous loops. "
+                    "Please conclude your task immediately and report the error under Next Steps."
+                )
+            }],
+            "isError": True
+        }
 
 def handle_trace_symbol(args: dict) -> dict:
     symbol = (args.get("symbol") or args.get("name") or "").strip()
@@ -624,22 +742,32 @@ def process_message(msg: dict) -> dict:
         params = msg.get("params", {})
         tool_name = params.get("name")
         tool_args = params.get("arguments", {})
-        
-        if tool_name in ("write_to_file", "write_file"):
-            res = handle_write_to_file(tool_args)
-        elif tool_name in ("replace_file_content", "replace_content"):
-            res = handle_replace_file_content(tool_args)
-        elif tool_name == "run_command":
-            res = handle_run_command(tool_args)
-        elif tool_name == "ask_local_assistant":
-            res = handle_ask_local_assistant(tool_args)
-        elif tool_name == "trace_symbol":
-            res = handle_trace_symbol(tool_args)
-        elif tool_name in ("delete_file", "remove_file"):
-            res = handle_delete_file(tool_args)
-        else:
-            res = {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True}
-        
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                tool_args = {}
+        elif not isinstance(tool_args, dict):
+            tool_args = {}
+
+        try:
+            if tool_name in ("write_to_file", "write_file"):
+                res = handle_write_to_file(tool_args)
+            elif tool_name in ("replace_file_content", "replace_content"):
+                res = handle_replace_file_content(tool_args)
+            elif tool_name == "run_command":
+                res = handle_run_command(tool_args)
+            elif tool_name == "ask_local_assistant":
+                res = handle_ask_local_assistant(tool_args)
+            elif tool_name == "trace_symbol":
+                res = handle_trace_symbol(tool_args)
+            elif tool_name in ("delete_file", "remove_file"):
+                res = handle_delete_file(tool_args)
+            else:
+                res = {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True}
+        except Exception as e:
+            res = {"content": [{"type": "text", "text": f"Tool execution error: {e}"}], "isError": True}
+
         return {
             "jsonrpc": "2.0",
             "id": req_id,

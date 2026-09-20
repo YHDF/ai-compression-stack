@@ -13,6 +13,7 @@ from pathlib import Path
 from mcp_workspace import (
     normalize_path,
     handle_write_to_file,
+    handle_replace_file_content,
     handle_delete_file,
     handle_run_command,
     retrieve_local_workspace_context,
@@ -31,6 +32,8 @@ class TestMCPWorkspace(unittest.TestCase):
         self.test_workspace.mkdir(parents=True, exist_ok=True)
         os.environ["WORKSPACE_DIR"] = str(self.test_workspace)
         import mcp_workspace
+        mcp_workspace._local_assistant_status["failures"] = 0
+        mcp_workspace._local_assistant_status["last_error"] = None
         self.patcher = patch.object(mcp_workspace, 'WORKSPACE_ROOT', str(self.test_workspace.resolve()))
         self.patcher.start()
 
@@ -120,7 +123,7 @@ class TestMCPWorkspace(unittest.TestCase):
     def test_handle_ask_local_assistant_ollama_mock(self, mock_urlopen):
         # Mock local Ollama HTTP response
         mock_response = MagicMock()
-        mock_response.read.return_value = b'{"response": "Here is the drafted mock function:\\n```python\\ndef mock_user():\\n    return {\\"id\\": 1}\\n```"}'
+        mock_response.__iter__.return_value = [b'{"response": "Here is the drafted mock function:\\n```python\\ndef mock_user():\\n    return {\\"id\\": 1}\\n```", "done": true}\n']
         mock_response.__enter__.return_value = mock_response
         mock_urlopen.return_value = mock_response
 
@@ -170,6 +173,103 @@ class TestMCPWorkspace(unittest.TestCase):
         self.assertIn("trace_symbol", guarded)
         self.assertIn("Absolute Test Prohibition", guarded)
         self.assertIn("Zero Search Loops", guarded)
+
+    @patch("urllib.request.urlopen")
+    def test_ask_local_assistant_circuit_breaker_on_failure(self, mock_urlopen):
+        import mcp_workspace
+        # Simulate an Ollama timeout / network error
+        mock_urlopen.side_effect = Exception("HTTP 504 Gateway Timeout")
+
+        # First call fails and activates circuit breaker
+        res = handle_ask_local_assistant({"query": "Draft a handler"})
+        self.assertTrue(res.get("isError"))
+        self.assertIn("CIRCUIT BREAKER", res["content"][0]["text"])
+        self.assertEqual(mcp_workspace._local_assistant_status["failures"], 1)
+
+        # Subsequent call is immediately blocked without reaching network
+        res2 = handle_ask_local_assistant({"query": "Draft a handler retry"})
+        self.assertTrue(res2.get("isError"))
+        self.assertIn("CIRCUIT BREAKER ACTIVE", res2["content"][0]["text"])
+
+    def test_guardrail_defusal_when_circuit_breaker_active(self):
+        import mcp_workspace
+        # Simulate tripped circuit breaker
+        mcp_workspace._local_assistant_status["failures"] = 1
+        mcp_workspace._local_assistant_status["last_error"] = "Timeout"
+
+        # Large write (>30 lines) must NOT order the agent to retry ask_local_assistant
+        large_code = "\n".join([f"line_{i} = {i}" for i in range(40)])
+        res_write = handle_write_to_file({"path": "large_file.py", "content": large_code})
+        self.assertTrue(res_write.get("isError"))
+        self.assertIn("CIRCUIT BREAKER ACTIVATED", res_write["content"][0]["text"])
+        self.assertNotIn("You MUST invoke 'ask_local_assistant", res_write["content"][0]["text"])
+
+        # Large replace (>30 lines) must NOT order the agent to retry ask_local_assistant
+        target_file = self.test_workspace / "existing.py"
+        target_file.write_text("old_block\n", encoding="utf-8")
+        res_replace = handle_replace_file_content({
+            "path": "existing.py",
+            "TargetContent": "old_block\n",
+            "ReplacementContent": large_code
+        })
+        self.assertTrue(res_replace.get("isError"))
+        self.assertIn("CIRCUIT BREAKER ACTIVATED", res_replace["content"][0]["text"])
+        self.assertNotIn("You MUST invoke 'ask_local_assistant", res_replace["content"][0]["text"])
+
+    def test_run_command_sandbox_blocks_exploratory_traversals(self):
+        # find / and root searches must be blocked
+        res_find = handle_run_command({"command": "find / -name '*domain*.csv'"})
+        self.assertTrue(res_find.get("isError"))
+        self.assertIn("Exploratory system search", res_find["content"][0]["text"])
+
+        # History inspection must be blocked
+        res_hist = handle_run_command({"command": "cat ~/.bash_history"})
+        self.assertTrue(res_hist.get("isError"))
+        self.assertIn("Exploratory system search", res_hist["content"][0]["text"])
+
+        # Brain inspection must be blocked
+        res_brain = handle_run_command({"command": "ls /home/appuser/.gemini/antigravity-cli/brain/"})
+        self.assertTrue(res_brain.get("isError"))
+        self.assertIn("Exploratory system search", res_brain["content"][0]["text"])
+
+    @patch("subprocess.run")
+    def test_agy_max_turns_parameter(self, mock_sub):
+        from app import execute_agy
+        mock_sub.return_value = MagicMock(returncode=0, stdout="Done", stderr="")
+        with patch("shutil.which", return_value="/bin/agy"), patch("os.path.exists", return_value=True), patch("os.access", return_value=True):
+            execute_agy("Test prompt")
+            mock_sub.assert_called_once()
+            called_cmd = mock_sub.call_args[0][0]
+            self.assertIn("--max-turns", called_cmd)
+            idx = called_cmd.index("--max-turns")
+            self.assertEqual(called_cmd[idx + 1], "2")
+
+    @patch("requests.post")
+    @patch("app.call_ollama_generation")
+    @patch("app.execute_agy")
+    def test_local_first_triage_csv_routing(self, mock_agy, mock_ollama, mock_post):
+        import json
+        from app import process_chat_request, ChatCompletionRequest, ChatMessage
+        mock_ollama.return_value = "### [data/test.csv]\ncol1,col2\nval1,val2"
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "response": json.dumps({
+                "complexity": "trivial",
+                "target_files": ["data/test.csv"],
+                "beautified_prompt": "Create data/test.csv"
+            })
+        }
+        mock_post.return_value = mock_resp
+
+        # Request with CSV in prompt should triage to Ollama directly without calling agy
+        req = ChatCompletionRequest(
+            model="coder",
+            messages=[ChatMessage(role="user", content="Create data/test.csv with sample domain data")]
+        )
+        res = process_chat_request(req)
+        mock_agy.assert_not_called()
+        mock_ollama.assert_called_once()
+        self.assertIn("Local Triage: Ollama", res)
 
 
 if __name__ == "__main__":
