@@ -231,16 +231,17 @@ class TestMCPWorkspace(unittest.TestCase):
         self.assertIn("Exploratory system search", res_brain["content"][0]["text"])
 
     @patch("subprocess.run")
-    def test_agy_max_turns_parameter(self, mock_sub):
-        from app import execute_agy
+    def test_agy_command_parameters(self, mock_sub):
+        from app import execute_agy, AGY_TIMEOUT
         mock_sub.return_value = MagicMock(returncode=0, stdout="Done", stderr="")
         with patch("shutil.which", return_value="/bin/agy"), patch("os.path.exists", return_value=True), patch("os.access", return_value=True):
             execute_agy("Test prompt")
             mock_sub.assert_called_once()
             called_cmd = mock_sub.call_args[0][0]
-            self.assertIn("--max-turns", called_cmd)
-            idx = called_cmd.index("--max-turns")
-            self.assertEqual(called_cmd[idx + 1], "2")
+            self.assertIn("--print-timeout", called_cmd)
+            idx = called_cmd.index("--print-timeout")
+            self.assertEqual(called_cmd[idx + 1], f"{AGY_TIMEOUT}s")
+            self.assertNotIn("--max-turns", called_cmd)
 
     @patch("requests.post")
     @patch("app.call_ollama_generation")

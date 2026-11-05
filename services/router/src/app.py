@@ -373,7 +373,6 @@ def execute_agy(prepared_prompt: str, agent_id: Optional[str] = None) -> Optiona
         "--model", AGY_MODEL,
         "--mode", "accept-edits",
         "--dangerously-skip-permissions",
-        "--max-turns", "2",
         "--print-timeout", f"{AGY_TIMEOUT}s"
     ]
     if agent_id:

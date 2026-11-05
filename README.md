@@ -29,7 +29,7 @@ User Prompt (Open WebUI / API)
            │
            ▼
 [ Tech Lead Orchestration (Claude 3.5 Sonnet via agy) ]
-    - Subprocess: agy --model claude-3-5-sonnet --max-turns 2 --mode accept-edits --dangerously-skip-permissions
+    - Subprocess: agy --model claude-3-5-sonnet --mode accept-edits --dangerously-skip-permissions --print-timeout 120s
     - Receives compressed workspace context upfront (no blind file-search loops).
     - Division of Labor (Zero Cloud Token Economy):
         • Core Implementation & Tests: Claude directly implements complete, production-ready

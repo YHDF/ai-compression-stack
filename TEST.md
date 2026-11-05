@@ -285,13 +285,13 @@ Target Implementations: [`services/router/src/mcp_workspace.py`](file:///c:/User
   - Executes commands targeting directories outside `/workspace`.
   - Asserts commands are blocked and return a sandboxing error.
 
-### 31. `test_agy_max_turns_parameter`
+### 31. `test_agy_command_parameters`
 - **Target Function:** `execute_agy(prompt, persona, model)`
 - **Scenario:** Subprocess invocation of Google Antigravity CLI.
 - **What It Does Exactly:**
   - Mocks `subprocess.run` / `Popen` for `agy`.
   - Inspects command arguments array.
-  - Asserts `--max-turns 2` is strictly present in the argument list to prevent runaway token spend.
+  - Asserts `--print-timeout` is configured and `--max-turns` is not present (unsupported in `agy` CLI).
 
 ### 32. `test_local_first_triage_forced_local`
 - **Target Function:** `process_chat_request(req_data)`
