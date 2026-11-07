@@ -1,9 +1,9 @@
 services:
   ollama:
     image: ollama/ollama:latest
-    container_name: local-ollama
+    container_name: aic-ollama
     ports:
-      - "11434:11434"
+      - "${PORT_OLLAMA:-11434}:11434"
     environment:
       - OLLAMA_KEEP_ALIVE=24h
       - OLLAMA_NUM_PARALLEL=1
@@ -13,14 +13,14 @@ services:
 
   headroom:
     build: ./services/headroom
-    container_name: headroom-proxy
+    container_name: aic-headroom
     ports:
-      - "8787:8787"
+      - "${PORT_HEADROOM:-8787}:8787"
     restart: unless-stopped
 
   router:
     build: ./services/router
-    container_name: quota-router
+    container_name: aic-quota-router
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     ports:
       - "${PORT_ROUTER:-8088}:8000"
@@ -56,9 +56,9 @@ services:
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
+    container_name: aic-open-webui
     ports:
-      - "3000:8080"
+      - "${PORT_WEBUI:-3001}:8080"
     environment:
       - OPENAI_API_BASE_URL=http://router:8000/v1
       - OPENAI_API_BASE_URLS=http://router:8000/v1;http://headroom:8787/v1

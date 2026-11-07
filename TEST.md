@@ -9,7 +9,7 @@ This document tracks all 40 automated unit, security, and integration tests acro
 Run the complete 40-test suite inside the running Docker container:
 
 ```bash
-docker exec quota-router python -m unittest discover -s tests
+docker exec aic-quota-router python -m unittest discover -s tests
 ```
 
 Or within the `services/router` directory:
@@ -364,6 +364,6 @@ When adding new tests:
 2. For routing, MCP tools, security sandboxing, or streaming: add to [`tests/test_mcp_workspace.py`](file:///c:/Users/EX4197/scripts/ai-compression-stack/services/router/tests/test_mcp_workspace.py).
 3. Validate locally:
    ```bash
-   docker exec quota-router python -m unittest discover -s tests
+   docker exec aic-quota-router python -m unittest discover -s tests
    ```
 4. Update this `TEST.md` reference to maintain full documentation traceability.

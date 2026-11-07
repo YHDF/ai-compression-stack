@@ -49,7 +49,7 @@ User Prompt (Open WebUI / API)
 
 ```mermaid
 flowchart TD
-    Client(["User Prompt<br>Open-WebUI :3000"]) -->|POST /v1/chat/completions| Router["Quota Router Gateway<br>FastAPI :8000 (Host :8088)"]
+    Client(["User Prompt<br>Open-WebUI :3001"]) -->|"POST /v1/chat/completions"| Router["Quota Router Gateway<br>FastAPI :8000 (Host :8088)"]
 
     Router --> CheckHeadroom{"Headroom Proxy Model?"}
     HeadroomDirect["Direct Pass-Through<br>Headroom Proxy :8787"]
@@ -61,12 +61,12 @@ flowchart TD
 
     CheckRoute -->|Yes| LocalTriage["2a. Local Ollama (0 Cloud Tokens)<br>• Fast local response<br>• Auto-persisted to /workspace disk"]
 
-    CheckRoute -->|No (Coding / Complex)| DispatchAgy["2b. Tech Lead Dispatch: agy (Claude 3.5 Sonnet)<br>• Full solution written in 1 turn via MCP write_to_file<br>• Boilerplate/seed data delegated to ask_local_assistant<br>• Fast symbol lookup via trace_symbol<br>• Command sandbox blocking runaway test logs"]
+    CheckRoute -->|"No (Coding / Complex)"| DispatchAgy["2b. Tech Lead Dispatch: agy (Claude 3.5 Sonnet)<br>• Full solution written in 1 turn via MCP write_to_file<br>• Boilerplate/seed data delegated to ask_local_assistant<br>• Fast symbol lookup via trace_symbol<br>• Command sandbox blocking runaway test logs"]
 
     DispatchAgy --> CheckStatus{"agy Result Code"}
 
-    CheckStatus -->|Exit 0| Deliver["3. Response & SSE Stream Completion<br>Files persisted to /workspace"]
-    CheckStatus -->|Non-Zero / Quota / Timeout| FallbackOllama["*[Fallback: Local Ollama]*<br>Local Model Code Gen & Disk Write"]
+    CheckStatus -->|"Exit 0"| Deliver["3. Response & SSE Stream Completion<br>Files persisted to /workspace"]
+    CheckStatus -->|"Non-Zero / Quota / Timeout"| FallbackOllama["Fallback: Local Ollama<br>Local Model Code Gen & Disk Write"]
 
     HeadroomDirect --> Envelope["OpenAI-Compatible Response Envelope"]
     LocalTriage --> Envelope
@@ -83,10 +83,10 @@ The stack is composed of 4 containerized services managed via `docker-compose.ym
 
 | Service | Container Name | Host Port | Internal Port | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **`router`** | `quota-router` | `8088` | `8000` | FastAPI gateway providing OpenAI-compatible `/v1/chat/completions`, AST code compressor, auto-discovery, telemetry (`/stats`), and model registry. |
-| **`headroom`** | `headroom-proxy` | `8787` | `8787` | Context compression and prefix-caching reverse proxy for direct LLM completions. |
-| **`ollama`** | `local-ollama` | `11434` | `11434` | Local inference engine (`qwen2.5-coder:1.5b`) for zero-cost boilerplate generation, in-flight MCP assistance, and offline fallback. |
-| **`open-webui`** | `open-webui` | `3000` | `8080` | Modern chat interface connected to `http://router:8000/v1` and `http://headroom:8787/v1`. |
+| **`router`** | `aic-quota-router` | `8088` | `8000` | FastAPI gateway providing OpenAI-compatible `/v1/chat/completions`, AST code compressor, auto-discovery, telemetry (`/stats`), and model registry. |
+| **`headroom`** | `aic-headroom` | `8787` | `8787` | Context compression and prefix-caching reverse proxy for direct LLM completions. |
+| **`ollama`** | `aic-ollama` | `11434` | `11434` | Local inference engine (`qwen2.5-coder:1.5b`) for zero-cost boilerplate generation, in-flight MCP assistance, and offline fallback. |
+| **`open-webui`** | `aic-open-webui` | `3001` | `8080` | Modern chat interface connected to `http://router:8000/v1` and `http://headroom:8787/v1`. |
 
 ---
 
@@ -212,7 +212,7 @@ docker compose run --rm -v "${PWD}/services/router:/app" -e PYTHONPATH=/app/src 
    ```
 
 5. **Access the Open-WebUI Frontend:**
-   Open your browser to [http://localhost:3000](http://localhost:3000).
+   Open your browser to [http://localhost:3001](http://localhost:3001).
 
 ---
 
@@ -242,7 +242,7 @@ Customize these variables in your `.env` file:
 ## Usage & API Testing
 
 ### 1. Persona Prompts in Open WebUI
-In [http://localhost:3000](http://localhost:3000), select `auto-router` (or any persona model) and type:
+In [http://localhost:3001](http://localhost:3001), select `auto-router` (or any persona model) and type:
 - `@coder Implement the email domain validation script and unit tests`
 - `@reviewer Check src/auth.py for unhandled exceptions and security risks`
 - `@architect Design a modular plugin architecture for the compression router`
